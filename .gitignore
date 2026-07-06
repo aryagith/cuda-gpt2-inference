@@ -1,0 +1,16 @@
+.venv/
+AGENTS.md
+PROJECT_PLAN.md
+STUDY_GUIDE.md
+*.md
+!README.md
+__pycache__/
+*.pyc
+build/
+*.pyd
+*.so
+*.obj
+*.ncu-rep
+*.nsys-rep
+results/
+models/

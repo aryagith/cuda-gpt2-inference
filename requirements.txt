@@ -1,0 +1,4 @@
+# Install the appropriate PyTorch CUDA wheel first; see README.md.
+torch>=2.7,<3
+ninja>=1.11
+transformers==4.57.6
