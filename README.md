@@ -33,6 +33,7 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark_attention.py` | Attention correctness, graph latency, and peak allocation |
 | `benchmark_decode.py` | One-query cache-attention correctness and graph latency |
 | `model_demo.py` | Pinned GPT-2, prompt/decode adapter, checks, generation, model benchmark |
+| `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
 ## Engineering report (local measurements, 2026-09-29)
 
@@ -80,6 +81,7 @@ five warmups. Input tensors and token IDs were already on the GPU.
 | Decode `[1,12,1,64]` over 256 keys | 37.1 µs | efficient SDPA 45.7 µs | Kernel-only win |
 | GPT-2 cached token after 129-token prefill | 8.18 ms | unchanged model 7.97 ms | No model-level speedup |
 | GPT-2 129-token prompt + 8 tokens | 70.47 ms | unchanged model 71.97 ms | Samples overlap; no firm speedup claim |
+| Same generation with static-cache CUDA Graph replay | 31.23 ms | dynamic SDPA 76.31 ms; custom dynamic 79.11 ms | Capture excluded; fixed length |
 
 At prompt `S=256`, the naive attention path increased peak live CUDA
 allocation by 10 MiB, while the single- and four-query paths each used 2 MiB.
@@ -98,8 +100,13 @@ prompt kernel calls totaling 19.01 ms single-query versus 11.53 ms four-query.
 These are kernel times, not whole-model times; no hardware counters were
 collected for the four-query or decode changes. Sharing K/V tiles is visible
 in the source, but a cache or occupancy explanation would require new counter
-measurements. At model level, other GPT-2 work and host overhead dominate the
-small decode kernel advantage, and short-sample timing varies.
+measurements. A full cached-token trace found about 258 GPU kernels per forward.
+Across five forwards, measured kernel execution summed to 14.82 ms (2.96 ms
+per token): cuBLAS matrix-vector work, including the vocabulary projection,
+used about 11.08 ms, versus 2.00 ms for efficient SDPA. Ordinary model wall
+time was around 8 ms per token, pointing to substantial host/launch gaps as
+well as the already optimized matrix operations. CUDA Graph replay addresses
+the launch gap; details and limits are below.
 
 **Reproduce.** Use the CUDA setup below in an x64 Native Tools Command Prompt,
 activate the environment, and download the pinned GPT-2 snapshot as shown in
@@ -117,6 +124,7 @@ python benchmark.py --device cuda --custom --rows 32 --width 1024 --warmup 5 --r
 python benchmark_attention.py --sequences 17,33,64,129,256 --output results/attention-local.json
 python benchmark_decode.py --output results/decode-local.json
 python model_demo.py --generation-length 129 --warmup 5 --repeats 9 --output results/model-local.json
+python graph_generation.py --output results/graph-local.json
 ```
 
 The benchmark JSON includes raw samples, backend selection, shape, precision,
@@ -466,3 +474,45 @@ identical text for every input. The custom route used 12 four-query prefill
 calls and 84 decode calls with no fallback; unsupported model calls still use
 Transformers SDPA. `results/model-decode-final.json` holds the exact samples,
 settings, model/weight hashes, source hashes, and call counts.
+
+## Full-model profiling and CUDA Graph replay
+
+Profiling five complete GPT-2 cached-token forwards after a 129-token prefill
+showed **1,290 GPU kernel launches**, or 258 per token. CUDA kernels occupied
+about 2.96 ms per forward in that trace; ordinary synchronized model forwards
+were around 8 ms without profiler instrumentation. The profiler changes
+absolute timing, so these figures identify work categories rather than provide
+a precise host/GPU time split. cuBLAS matrix-vector operations accounted for
+about 75% of measured GPU kernel time, including the final projection over
+GPT-2's vocabulary. Efficient SDPA accounted for about 14%. Replacing the
+already optimized cuBLAS operations with another hand-written kernel had no
+measured justification. The many small launches were a better target.
+
+`graph_generation.py` uses Transformers' `StaticCache` and PyTorch
+`torch.cuda.CUDAGraph` to capture the fixed-count decode loop once. Prefill
+still runs normally, then one graph replay executes all cached-token forwards,
+greedy `argmax` operations, and device-side cache-position updates. The static
+cache retains fixed addresses and masks unused future positions. This route
+uses PyTorch `EFFICIENT_ATTENTION` because the static cache supplies a mask;
+the custom decode kernel remains the separate dynamic-cache path.
+
+For one RTX 4060 Laptop GPU run with a 129-token unpadded prompt and eight new
+tokens, five warmups and nine paired, rotated-order wall-time samples measured:
+
+| Generation route | Median ms | Observed sample range ms |
+| --- | ---: | ---: |
+| Dynamic cache, efficient SDPA | 76.31 | 73.19–78.62 |
+| Dynamic cache, custom attention | 79.11 | 76.97–86.45 |
+| Static cache, captured decode loop | 31.23 | 29.78–37.38 |
+
+All three routes generated the same token IDs. Graph capture itself took
+85.31 ms in this run, after model loading and warmup, and is excluded from the
+table. It must be amortized across repeated same-shape runs. The graph fixes
+the batch, prompt length, and number of generated tokens; it does not handle
+early EOS, padding, arbitrary lengths, or dynamic branching. The benchmark
+resets/refills the static cache before each replay, so the table includes
+prefill and result assembly but excludes capture. Short 17-token/4-token and
+long 256-token/8-token correctness checks also matched ordinary generation.
+Raw samples, source hashes, and capture time are in ignored
+`results/graph-generation.json`; profiler traces and summaries are also under
+ignored `results/`.
