@@ -34,7 +34,21 @@ def main():
         parser.error("a CUDA-enabled PyTorch build is required")
     torch.backends.cuda.matmul.allow_tf32 = False
     tokenizer, model = load_model()
-    ids = input_ids(tokenizer, args.prompt, args.length)
+    prompt_texts = (
+        args.prompt,
+        "Explain how a GPU warp executes an instruction.",
+        "Write a short story about a lighthouse keeper.",
+        "What causes the seasons on Earth?",
+        "Summarize the benefits of unit tests.",
+        "Translate good morning into French.",
+        "How does a bicycle gear change speed?",
+        "Describe a recipe for vegetable soup.",
+        "Why does a rainbow have several colors?",
+    )
+    prompt_ids = [input_ids(tokenizer, prompt, args.length) for prompt in prompt_texts]
+    ids = prompt_ids[0].clone()
+    if len({tuple(prompt.flatten().tolist()) for prompt in prompt_ids}) != len(prompt_ids):
+        raise RuntimeError("benchmark prompts must have distinct token IDs")
     model.set_attn_implementation("sdpa")
     positions = torch.arange(ids.shape[1], device="cuda")
     cache = StaticCache(config=model.config, max_cache_len=ids.shape[1] + args.new_tokens)
@@ -82,9 +96,19 @@ def main():
         graph.replay()
         return torch.cat([ids, first] + graph_tokens, dim=1)
 
-    expected, _ = generate(model, tokenizer, ids, args.new_tokens, "sdpa")
-    if expected.shape[1] != ids.shape[1] + args.new_tokens:
-        raise RuntimeError("fixed-length graph requires generation without early EOS")
+    expected_by_prompt = []
+    for prompt in prompt_ids:
+        ids.copy_(prompt)
+        expected, _ = generate(model, tokenizer, ids, args.new_tokens, "sdpa")
+        if expected.shape[1] != ids.shape[1] + args.new_tokens:
+            raise RuntimeError("fixed-length graph requires generation without early EOS")
+        expected_by_prompt.append(expected)
+    distinct_continuations = len({tuple(output[0, -args.new_tokens:].tolist())
+                                  for output in expected_by_prompt})
+    if distinct_continuations < 2:
+        raise RuntimeError("benchmark prompts did not produce varied continuations")
+    ids.copy_(prompt_ids[0])
+    expected = expected_by_prompt[0]
     custom, custom_calls = generate(model, tokenizer, ids, args.new_tokens, ATTENTION_NAME)
     actual = graph_generate()
     torch.cuda.synchronize()
@@ -99,12 +123,15 @@ def main():
     runs = (("sdpa_dynamic", lambda: generate(model, tokenizer, ids, args.new_tokens, "sdpa")[0]),
             ("custom_dynamic", lambda: generate(model, tokenizer, ids, args.new_tokens, ATTENTION_NAME)[0]),
             ("sdpa_static_graph", graph_generate))
-    for _ in range(args.warmup):
+    for index in range(args.warmup):
+        ids.copy_(prompt_ids[index % len(prompt_ids)])
         for _, run in runs:
             run()
     samples = {name: [] for name, _ in runs}
     peaks = {name: [] for name, _ in runs}
     for index in range(args.repeats):
+        prompt_index = index % len(prompt_ids)
+        ids.copy_(prompt_ids[prompt_index])
         order = runs[index % len(runs):] + runs[:index % len(runs)]
         for name, run in order:
             torch.cuda.synchronize()
@@ -114,6 +141,8 @@ def main():
             torch.cuda.synchronize()
             samples[name].append((time.perf_counter() - start) * 1000)
             peaks[name].append(torch.cuda.max_memory_allocated())
+            if not torch.equal(output, expected_by_prompt[prompt_index]):
+                raise AssertionError(f"{name} produced wrong token IDs for prompt {prompt_index}")
             del output
 
     root = Path(__file__).resolve().parent
@@ -128,11 +157,16 @@ def main():
         "model_id": MODEL_ID, "model_revision": MODEL_REVISION,
         "weights_sha256": MODEL_WEIGHTS_SHA256, "dtype": "float32",
         "prompt_tokens": ids.shape[1], "new_tokens": args.new_tokens,
+        "distinct_prompts": len(prompt_ids),
+        "distinct_continuations": distinct_continuations,
+        "measured_prompt_indices": [index % len(prompt_ids) for index in range(args.repeats)],
         "warmup": args.warmup, "repeats": args.repeats, "tf32_matmul": False,
         "capture_ms": capture_ms,
+        "cold_graph_ms_estimate": capture_ms + statistics.median(samples["sdpa_static_graph"]),
+        "amortized_graph_ms_estimate": (capture_ms + sum(samples["sdpa_static_graph"])) / args.repeats,
         "graph_attention": "PyTorch EFFICIENT_ATTENTION with StaticCache causal mask",
         "custom_attention": "custom prompt and dynamic-cache decode kernels",
-        "timing": "paired synchronized wall time, rotated order; prefill plus all generated tokens; capture excluded",
+        "timing": "paired synchronized wall time, rotated order, varying token IDs at fixed shape; prefill plus all generated tokens; capture excluded from samples, included in estimates; model load and warmup excluded",
         "token_ids_equal": True, "custom_calls": custom_calls,
         "source_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in sources},
         "results": {name: {"median_ms": statistics.median(values), "samples_ms": values,

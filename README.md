@@ -71,7 +71,7 @@ portable speed guarantees. Kernel values use warmed CUDA graph replay events
 with seven samples; model values use nine synchronized wall-time samples after
 five warmups. Input tensors and token IDs were already on the GPU.
 
-| Workload | Custom | Comparison | Interpretation |
+| Workload | Measured path | Comparison | Interpretation |
 | --- | ---: | ---: | --- |
 | RMSNorm 32×1024 | 2.47 µs | native PyTorch 2.75 µs | Small measured win |
 | RMSNorm 1024×1024 | 15.20 µs | native PyTorch 11.77 µs | Custom loses |
@@ -81,7 +81,7 @@ five warmups. Input tensors and token IDs were already on the GPU.
 | Decode `[1,12,1,64]` over 256 keys | 37.1 µs | efficient SDPA 45.7 µs | Kernel-only win |
 | GPT-2 cached token after 129-token prefill | 8.18 ms | unchanged model 7.97 ms | No model-level speedup |
 | GPT-2 129-token prompt + 8 tokens | 70.47 ms | unchanged model 71.97 ms | Samples overlap; no firm speedup claim |
-| Same generation with static-cache CUDA Graph replay | 31.23 ms | dynamic SDPA 76.31 ms; custom dynamic 79.11 ms | Capture excluded; fixed length |
+| Nine distinct 129-token prompts + 8 tokens, static-cache graph | 29.75 ms | dynamic SDPA 72.38 ms; custom dynamic 74.23 ms | Replay only; fixed shape |
 
 At prompt `S=256`, the naive attention path increased peak live CUDA
 allocation by 10 MiB, while the single- and four-query paths each used 2 MiB.
@@ -496,23 +496,31 @@ cache retains fixed addresses and masks unused future positions. This route
 uses PyTorch `EFFICIENT_ATTENTION` because the static cache supplies a mask;
 the custom decode kernel remains the separate dynamic-cache path.
 
-For one RTX 4060 Laptop GPU run with a 129-token unpadded prompt and eight new
-tokens, five warmups and nine paired, rotated-order wall-time samples measured:
+For one RTX 4060 Laptop GPU run with nine **different prompt token sequences**
+of the same 129-token length and eight new tokens each, five warmups and nine
+paired, rotated-order wall-time samples measured:
 
 | Generation route | Median ms | Observed sample range ms |
 | --- | ---: | ---: |
-| Dynamic cache, efficient SDPA | 76.31 | 73.19–78.62 |
-| Dynamic cache, custom attention | 79.11 | 76.97–86.45 |
-| Static cache, captured decode loop | 31.23 | 29.78–37.38 |
+| Dynamic cache, efficient SDPA | 72.38 | 66.69–85.26 |
+| Dynamic cache, custom attention | 74.23 | 71.51–84.84 |
+| Static cache, captured decode loop | 29.75 | 28.53–34.47 |
 
-All three routes generated the same token IDs. Graph capture itself took
-85.31 ms in this run, after model loading and warmup, and is excluded from the
-table. It must be amortized across repeated same-shape runs. The graph fixes
-the batch, prompt length, and number of generated tokens; it does not handle
-early EOS, padding, arbitrary lengths, or dynamic branching. The benchmark
-resets/refills the static cache before each replay, so the table includes
-prefill and result assembly but excludes capture. Short 17-token/4-token and
-long 256-token/8-token correctness checks also matched ordinary generation.
+All three routes generated the same token IDs for every prompt; the nine
+prompts also produced nine distinct continuations. One graph was
+captured with the first prompt and replayed after loading each different prompt
+into the same-shaped input buffer. Capture took 65.93 ms after model loading
+and warmup. Adding it to median replay gives an estimated **95.68 ms first
+graph request**, slower than the 72.38 ms ordinary median. Spread over these
+nine requests, capture plus replay averaged an estimated 37.96 ms per request,
+versus 73.64 ms mean for dynamic SDPA. These estimates exclude model loading,
+warmup, and tokenization. Prompt texts are tokenized and repeated to the fixed
+length by the existing `input_ids` helper, so this is a controlled same-shape
+experiment, not a representative variable-length serving workload. The graph
+fixes the batch, prompt length, and number of generated tokens; it does not
+handle early EOS, padding, arbitrary lengths, or dynamic branching. Prefill
+and result assembly are included in each timed sample. Short 17-token/4-token
+and long 256-token/8-token correctness checks also matched ordinary generation.
 Raw samples, source hashes, and capture time are in ignored
-`results/graph-generation.json`; profiler traces and summaries are also under
-ignored `results/`.
+`results/graph-varying-prompts.json`; profiler traces and summaries are also
+under ignored `results/`.
