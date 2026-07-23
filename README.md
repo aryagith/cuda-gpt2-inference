@@ -33,6 +33,7 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark_attention.py` | Attention correctness, graph latency, and peak allocation |
 | `benchmark_decode.py` | One-query cache-attention correctness and graph latency |
 | `model_demo.py` | Pinned GPT-2, prompt/decode adapter, checks, generation, model benchmark |
+| `benchmark_greedy.py` | Varied-prompt end-to-end greedy generation comparison |
 | `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
 ## Engineering report (local measurements, 2026-09-29)
@@ -68,8 +69,9 @@ prompt and eight generated tokens, greedy IDs matched and counters recorded
 
 **Selected performance evidence.** Medians below are local observations, not
 portable speed guarantees. Kernel values use warmed CUDA graph replay events
-with seven samples; model values use nine synchronized wall-time samples after
-five warmups. Input tensors and token IDs were already on the GPU.
+with seven samples. The varied-prompt direct row uses 27 synchronized
+text-to-text wall-time samples after three warmups; the other generation rows
+have their methods detailed below.
 
 | Workload | Measured path | Comparison | Interpretation |
 | --- | ---: | ---: | --- |
@@ -81,6 +83,7 @@ five warmups. Input tensors and token IDs were already on the GPU.
 | Decode `[1,12,1,64]` over 256 keys | 37.1 µs | efficient SDPA 45.7 µs | Kernel-only win |
 | GPT-2 cached token after 129-token prefill | 8.18 ms | unchanged model 7.97 ms | No model-level speedup |
 | GPT-2 129-token prompt + 8 tokens | 70.47 ms | unchanged model 71.97 ms | Samples overlap; no firm speedup claim |
+| GPT-2 text-to-text, varied 6–10-token prompts + 8 tokens | direct greedy 74.04 ms | `model.generate` 86.71 ms | Same token IDs; 26/27 paired wins, no graph |
 | Nine distinct 129-token prompts + 8 tokens, static-cache graph | 29.75 ms | dynamic SDPA 72.38 ms; custom dynamic 74.23 ms | Replay only; fixed shape |
 
 At prompt `S=256`, the naive attention path increased peak live CUDA
@@ -124,6 +127,7 @@ python benchmark.py --device cuda --custom --rows 32 --width 1024 --warmup 5 --r
 python benchmark_attention.py --sequences 17,33,64,129,256 --output results/attention-local.json
 python benchmark_decode.py --output results/decode-local.json
 python model_demo.py --generation-length 129 --warmup 5 --repeats 9 --output results/model-local.json
+python benchmark_greedy.py --output results/greedy-local.json
 python graph_generation.py --output results/graph-local.json
 ```
 
@@ -474,6 +478,40 @@ identical text for every input. The custom route used 12 four-query prefill
 calls and 84 decode calls with no fallback; unsupported model calls still use
 Transformers SDPA. `results/model-decode-final.json` holds the exact samples,
 settings, model/weight hashes, source hashes, and call counts.
+
+## Varied-prompt generation without capture
+
+`model_demo.greedy_generate` uses GPT-2's existing PyTorch SDPA and dynamic KV
+cache, but runs the fixed-count greedy token loop directly. It requests only
+the final position's logits on each forward. This path has no graph capture,
+fixed prompt shape, or per-shape setup. It accepts unpadded prompt lengths up
+to GPT-2's position limit. It always emits the requested number of tokens;
+unlike `model.generate`, it does not stop early on EOS or implement sampling.
+
+On the RTX 4060 Laptop GPU, nine distinct natural prompt texts of 6–10 tokens
+each were generated three times for eight new tokens. Three warmups preceded
+27 paired synchronized wall-time samples with alternating execution order.
+The timer includes tokenization, GPU input transfer, generation, and output
+decoding. All generated token IDs and text matched `model.generate`; the direct
+route was faster in 26 of 27 pairs. Medians were **86.71 ms** for
+`model.generate` and **74.04 ms** for the direct loop, a 14.6% latency
+reduction. Samples ranged 69.82–123.32 ms and 58.76–92.12 ms, respectively.
+A separate nine-prompt check with 16 new tokens also matched IDs and measured
+141.51 versus 121.26 ms median; it is a smaller sample. Three longer natural
+prompts of 47, 84, and 117 tokens, measured three times each for eight new
+tokens, also matched IDs: medians were 72.25 ms ordinary versus 60.28 ms
+direct, with nine of nine paired wins.
+Model loading and warmup were excluded equally. No CUDA Graph capture is
+required. This speedup is from a
+simpler generation path, not from the custom attention kernels; the benchmark
+does not isolate which removed framework steps account for the gain. An exploratory
+FP16 check on nine varied prompts did not improve median latency, so FP16 is
+not claimed as a win here. Raw samples and source hashes are in ignored
+`results/greedy-generation.json` and `results/greedy-generation-16.json`.
+The longer-prompt report is ignored `results/greedy-long-prompts.json`.
+To compare your own queries, put one unpadded prompt per line in an ignored
+file under `results/` and run
+`python benchmark_greedy.py --prompts-file results/your-prompts.txt`.
 
 ## Full-model profiling and CUDA Graph replay
 

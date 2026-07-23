@@ -153,6 +153,25 @@ def generate(model, tokenizer, ids, new_tokens, implementation):
     return generated, CALLS.copy()
 
 
+@torch.inference_mode()
+def greedy_generate(model, ids, new_tokens):
+    """Fixed-count greedy generation with the existing PyTorch SDPA and KV cache."""
+    if new_tokens < 1 or ids.shape[1] + new_tokens > model.config.n_positions:
+        raise ValueError("new_tokens must be positive and fit GPT-2's position limit")
+    model.set_attn_implementation("sdpa")
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        output = model(ids, use_cache=True, logits_to_keep=1)
+        cache = output.past_key_values
+        token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
+        tokens = [token]
+        for _ in range(new_tokens - 1):
+            output = model(token, past_key_values=cache, use_cache=True, logits_to_keep=1)
+            cache = output.past_key_values
+            token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
+            tokens.append(token)
+    return torch.cat([ids, *tokens], dim=1)
+
+
 def measure(run, warmup, repeats):
     for _ in range(warmup):
         output = run()
