@@ -1,8 +1,9 @@
 # CUDA Attention Engine
 
 A focused C++/CUDA learning and performance project with verified float32
-RMSNorm, causal prompt attention, and cached-token attention on an RTX 4060
-Laptop GPU (8 GB). The custom attention paths run inside pinned GPT-2; the
+RMSNorm, causal prompt attention, cached-token attention, and fused GPT-2 GELU
+on an RTX 4060 Laptop GPU (8 GB). The custom attention paths run inside pinned
+GPT-2; the
 unchanged model is the correctness and latency baseline. The local,
 Git-ignored `PROJECT_PLAN.md` holds the detailed handoff.
 
@@ -34,6 +35,8 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark_decode.py` | One-query cache-attention correctness and graph latency |
 | `model_demo.py` | Pinned GPT-2, prompt/decode adapter, checks, generation, model benchmark |
 | `benchmark_greedy.py` | Varied-prompt end-to-end greedy generation comparison |
+| `gelu_new.py`, `csrc/gelu*` | Fused CUDA GPT-2 GELU activation and native validation |
+| `test_gelu.py`, `benchmark_gelu.py` | Activation correctness and paired model benchmark |
 | `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
 ## Engineering report (local measurements, 2026-09-29)
@@ -69,9 +72,9 @@ prompt and eight generated tokens, greedy IDs matched and counters recorded
 
 **Selected performance evidence.** Medians below are local observations, not
 portable speed guarantees. Kernel values use warmed CUDA graph replay events
-with seven samples. The varied-prompt direct row uses 27 synchronized
-text-to-text wall-time samples after three warmups; the other generation rows
-have their methods detailed below.
+with seven samples. The varied-prompt direct and fused-GELU rows each use 27
+synchronized text-to-text wall-time samples after three warmups; the other
+generation rows have their methods detailed below.
 
 | Workload | Measured path | Comparison | Interpretation |
 | --- | ---: | ---: | --- |
@@ -84,6 +87,7 @@ have their methods detailed below.
 | GPT-2 cached token after 129-token prefill | 8.18 ms | unchanged model 7.97 ms | No model-level speedup |
 | GPT-2 129-token prompt + 8 tokens | 70.47 ms | unchanged model 71.97 ms | Samples overlap; no firm speedup claim |
 | GPT-2 text-to-text, varied 6–10-token prompts + 8 tokens | direct greedy 74.04 ms | `model.generate` 86.71 ms | Same token IDs; 26/27 paired wins, no graph |
+| GPT-2 direct greedy with fused CUDA GELU, same prompt set | 56.88 ms | direct greedy with PyTorch GELU 70.58 ms | Same token IDs; 24/27 paired wins |
 | Nine distinct 129-token prompts + 8 tokens, static-cache graph | 29.75 ms | dynamic SDPA 72.38 ms; custom dynamic 74.23 ms | Replay only; fixed shape |
 
 At prompt `S=256`, the naive attention path increased peak live CUDA
@@ -128,6 +132,8 @@ python benchmark_attention.py --sequences 17,33,64,129,256 --output results/atte
 python benchmark_decode.py --output results/decode-local.json
 python model_demo.py --generation-length 129 --warmup 5 --repeats 9 --output results/model-local.json
 python benchmark_greedy.py --output results/greedy-local.json
+python test_gelu.py --cuda
+python benchmark_gelu.py --output results/gelu-local.json
 python graph_generation.py --output results/graph-local.json
 ```
 
@@ -512,6 +518,42 @@ The longer-prompt report is ignored `results/greedy-long-prompts.json`.
 To compare your own queries, put one unpadded prompt per line in an ignored
 file under `results/` and run
 `python benchmark_greedy.py --prompts-file results/your-prompts.txt`.
+
+## Fused GPT-2 GELU: a custom kernel with a model-level win
+
+GPT-2's `gelu_new` applies several PyTorch elementwise operations after each
+MLP `c_fc` projection. `csrc/gelu.cu` computes the same tanh-based expression
+in one forward-only float32 kernel: one thread reads and writes one adjacent
+element, keeping its intermediate values in registers. It uses no shared
+memory or inter-thread synchronization. The model's cuBLAS projections remain
+unchanged. `set_gpt2_cuda_gelu(model, True)` in `gelu_new.py` replaces the 12
+GPT-2 MLP activation modules; passing `False` restores the PyTorch activation.
+
+For a decode-shaped `[1,1,3072]` activation, nine paired wall-time samples of
+100 calls each averaged **121.85 µs per PyTorch activation versus 13.99 µs**
+per fused CUDA activation at the median. These are launch-inclusive per-call
+measurements, not GPU-only kernel times. The more important check uses the
+same `model_demo.greedy_generate` path on both sides. For nine naturally
+different 6–10-token prompts, three passes each and eight generated tokens,
+the complete text-to-text median was **70.58 ms** with PyTorch GELU and
+**56.88 ms** with custom GELU, a 19.4% reduction. Custom won 24 of 27 paired
+samples; all generated token IDs and text matched. Longer 47/84/117-token
+prompts measured 53.17/42.02 ms (nine of nine paired wins), and a nine-prompt
+16-new-token check measured 106.74/82.76 ms (eight of nine wins). These latter
+two sets are smaller samples. All timing includes tokenization, GPU input
+transfer, generation, and text decoding; model load, activation swapping,
+extension compilation, and warmup are excluded equally. No graph is captured.
+
+At S129, the largest intermediate hidden-state difference was 0.00213, while
+the largest prompt-logit difference was 6.10e-5 and next-token logit difference
+was 1.07e-4. The GPU test compares against Transformers' activation at decode
+and prompt shapes and checks a non-default stream. CPU reference verification:
+one test passed, two CUDA tests skipped. CUDA verification: all three tests
+passed. Compute Sanitizer memcheck and synccheck reported zero errors.
+Racecheck ran the tests but stalled before its final sanitizer summary, so it
+is not recorded as a racecheck pass. Raw samples and source hashes are in
+ignored `results/gelu-generation.json`, `results/gelu-long-prompts.json`, and
+`results/gelu-generation-16.json`; sanitizer logs are also ignored.
 
 ## Full-model profiling and CUDA Graph replay
 
