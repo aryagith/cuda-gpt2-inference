@@ -555,6 +555,16 @@ is not recorded as a racecheck pass. Raw samples and source hashes are in
 ignored `results/gelu-generation.json`, `results/gelu-long-prompts.json`, and
 `results/gelu-generation-16.json`; sanitizer logs are also ignored.
 
+A fresh same-source rerun on 2026-09-29 reproduced the improvement: the 27
+short-prompt pairs measured **54.17/42.77 ms** PyTorch/custom medians (21.0%
+lower; 26/27 paired wins), the nine long-prompt pairs **53.12/40.76 ms**
+(9/9 wins), and the nine 16-token pairs **105.10/80.06 ms** (9/9 wins).
+Every pair produced identical token IDs and text. The isolated activation
+rerun measured 110.49/11.33 µs launch-inclusive medians. CPU reference: one
+pass, two GPU skips; CUDA: three passes; fresh memcheck and synccheck: zero
+errors. Absolute times varied between runs, so the paired comparisons are the
+useful evidence. The ignored rerun reports are `results/gelu-*-verification.json`.
+
 ## Full-model profiling and CUDA Graph replay
 
 Profiling five complete GPT-2 cached-token forwards after a 129-token prefill
