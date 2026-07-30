@@ -550,10 +550,14 @@ was 1.07e-4. The GPU test compares against Transformers' activation at decode
 and prompt shapes and checks a non-default stream. CPU reference verification:
 one test passed, two CUDA tests skipped. CUDA verification: all three tests
 passed. Compute Sanitizer memcheck and synccheck reported zero errors.
-Racecheck ran the tests but stalled before its final sanitizer summary, so it
-is not recorded as a racecheck pass. Raw samples and source hashes are in
+The full-suite racecheck completed its tests but stalled during shutdown.
+A focused racecheck of the GELU kernel later completed for 1-element,
+decode-shaped `[1,1,3072]`, and prompt-shaped `[1,129,3072]` inputs:
+**0 hazards, 0 errors, 0 warnings**. GELU uses no shared memory, which is
+the memory racecheck examines. Raw samples and source hashes are in
 ignored `results/gelu-generation.json`, `results/gelu-long-prompts.json`, and
-`results/gelu-generation-16.json`; sanitizer logs are also ignored.
+`results/gelu-generation-16.json`; the ignored focused sanitizer log is
+`results/gelu-racecheck-focused.log`.
 
 A fresh same-source rerun on 2026-09-29 reproduced the improvement: the 27
 short-prompt pairs measured **54.17/42.77 ms** PyTorch/custom medians (21.0%
