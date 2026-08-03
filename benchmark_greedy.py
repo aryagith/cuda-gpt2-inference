@@ -99,9 +99,13 @@ def main():
         "prompt_lengths": [ids.shape[1] for ids in prompts],
         "warmup": args.warmup, "repeats_per_prompt": args.repeats,
         "timing": "paired synchronized text-to-text wall time, alternating order; includes tokenization, GPU input transfer, generation, and decoding; model load and warmup excluded; no graph capture",
+        "throughput": "end-to-end output tokens/s = new_tokens / complete request seconds; not steady-state decode throughput",
         "token_ids_equal": True, "first_output": first_output,
         "source_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in sources},
-        "results": {name: {"median_ms": statistics.median(values), "samples_ms": values}
+        "results": {name: {"median_ms": statistics.median(values),
+                           "median_output_tokens_per_s": statistics.median(
+                               1000 * args.new_tokens / ms for ms in values),
+                           "samples_ms": values}
                     for name, values in samples.items()},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +114,9 @@ def main():
                       "token_ids_equal": True,
                       "median_ms": {name: result["median_ms"]
                                     for name, result in report["results"].items()},
+                      "median_output_tokens_per_s":
+                      {name: result["median_output_tokens_per_s"]
+                       for name, result in report["results"].items()},
                       "report": str(args.output)}, indent=2))
 
 

@@ -103,19 +103,26 @@ def main():
         "new_tokens": args.new_tokens, "warmup": args.warmup,
         "repeats_per_prompt": args.repeats,
         "timing": "paired synchronized text-to-text wall time, alternating order; includes tokenization, transfer, generation, decoding; activation swap, model load, warmup excluded",
+        "throughput": "end-to-end output tokens/s = new_tokens / complete request seconds; not steady-state decode throughput",
         "intermediate_max_hidden_abs_error": max(hidden_errors),
         "intermediate_max_logit_abs_error": logit_error,
         "cached_max_logit_abs_error": cached_logit_error,
         "token_ids_and_text_equal": True,
         "source_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                           for name in sources},
-        "results": {name: {"median_ms": statistics.median(values), "samples_ms": values}
+        "results": {name: {"median_ms": statistics.median(values),
+                           "median_output_tokens_per_s": statistics.median(
+                               1000 * args.new_tokens / ms for ms in values),
+                           "samples_ms": values}
                     for name, values in samples.items()},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"median_ms": {name: values["median_ms"]
                                     for name, values in report["results"].items()},
+                      "median_output_tokens_per_s":
+                      {name: values["median_output_tokens_per_s"]
+                       for name, values in report["results"].items()},
                       "intermediate_max_logit_abs_error": logit_error,
                       "token_ids_and_text_equal": True,
                       "report": str(args.output)}, indent=2))

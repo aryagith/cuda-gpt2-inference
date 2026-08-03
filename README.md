@@ -519,6 +519,14 @@ To compare your own queries, put one unpadded prompt per line in an ignored
 file under `results/` and run
 `python benchmark_greedy.py --prompts-file results/your-prompts.txt`.
 
+Both generation benchmarks now also report **end-to-end output tokens/s**:
+newly generated tokens divided by synchronized text-to-text request time.
+This includes prompt processing and decoding, so it is not steady-state decode
+throughput or multi-request server throughput. In a fresh 27-pair eight-token
+run, `model.generate` measured 61.13 ms / 130.9 output tokens/s and the direct
+loop 51.33 ms / 155.9 output tokens/s; all outputs matched, with 26/27 paired
+direct wins. Raw samples are in ignored `results/greedy-throughput.json`.
+
 ## Fused GPT-2 GELU: a custom kernel with a model-level win
 
 GPT-2's `gelu_new` applies several PyTorch elementwise operations after each
@@ -569,6 +577,11 @@ pass, two GPU skips; CUDA: three passes; fresh memcheck and synccheck: zero
 errors. Absolute times varied between runs, so the paired comparisons are the
 useful evidence. The ignored rerun reports are `results/gelu-*-verification.json`.
 
+With the same eight-token workload and the new throughput field, a further
+27-pair run measured 54.96 ms / **145.5 output tokens/s** for PyTorch GELU and
+43.08 ms / **185.7 output tokens/s** for custom GELU. Outputs matched exactly;
+custom won 27/27 pairs. Raw samples are in ignored `results/gelu-throughput.json`.
+
 ## Full-model profiling and CUDA Graph replay
 
 Profiling five complete GPT-2 cached-token forwards after a 129-token prefill
@@ -581,6 +594,18 @@ about 75% of measured GPU kernel time, including the final projection over
 GPT-2's vocabulary. Efficient SDPA accounted for about 14%. Replacing the
 already optimized cuBLAS operations with another hand-written kernel had no
 measured justification. The many small launches were a better target.
+
+After fused GELU, a new five-forward S129 cached-token profile with
+`logits_to_keep=1` found 48 `addmm` calls and one vocabulary `mm` per forward,
+about 1.75 ms and 0.72 ms of GPU work per forward in that instrumented run.
+Efficient attention used about 0.40 ms. Each forward also invoked 25 native
+LayerNorm operations, 25 residual/embedding adds, and 24 cache concatenations.
+The next bounded custom-kernel experiment is to fuse each attention residual
+add with the following `ln_2` LayerNorm, returning both the summed residual
+and normalized value. This could remove 12 small launches per cached token;
+a whole-request paired benchmark must establish whether it actually helps.
+The ignored profile is `results/profile-gelu-token.json`. Profiler timing is
+diagnostic and should not be compared directly with unprofiled latency.
 
 `graph_generation.py` uses Transformers' `StaticCache` and PyTorch
 `torch.cuda.CUDAGraph` to capture the fixed-count decode loop once. Prefill
