@@ -1,4 +1,4 @@
-"""Measure fused CUDA gelu_new inside GPT-2 direct greedy generation."""
+"""Measure fused GELU or residual-LayerNorm in GPT-2 greedy generation."""
 
 import argparse
 from datetime import datetime, timezone
@@ -11,6 +11,7 @@ import time
 import torch
 
 from benchmark_greedy import PROMPTS
+from fused_ln import set_gpt2_fused_ln
 from gelu_new import set_gpt2_cuda_gelu
 from model_demo import (MODEL_ID, MODEL_REVISION, MODEL_WEIGHTS_SHA256,
                         greedy_generate, input_ids, load_model)
@@ -23,8 +24,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3, help="passes over all prompts")
     parser.add_argument("--prompts-file", type=Path, help="one unpadded prompt per line")
-    parser.add_argument("--output", type=Path, default=Path("results/gelu-generation.json"))
+    parser.add_argument("--fused-ln", action="store_true", help="compare with/without fused attention residual and ln_2, keeping CUDA GELU on both paths")
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = Path("results/fused-ln-generation.json" if args.fused_ln
+                           else "results/gelu-generation.json")
     if args.new_tokens < 1 or args.warmup < 1 or args.repeats < 1:
         parser.error("new-tokens, warmup, and repeats must be positive")
     if not torch.cuda.is_available():
@@ -42,9 +47,17 @@ def main():
     # Check intermediate tensors before timing complete generation.
     ids = input_ids(tokenizer, prompt_texts[0], 129)
     model.set_attn_implementation("sdpa")
-    set_gpt2_cuda_gelu(model, False)
+    if args.fused_ln:
+        set_gpt2_cuda_gelu(model, True)
+        set_route = lambda enabled: set_gpt2_fused_ln(model, enabled)
+        routes = (("pytorch_ln", False), ("cuda_fused_ln", True))
+    else:
+        set_route = lambda enabled: set_gpt2_cuda_gelu(model, enabled)
+        routes = (("pytorch_gelu", False), ("cuda_gelu", True))
+    baseline_name, custom_name = routes[0][0], routes[1][0]
+    set_route(False)
     baseline = model(ids, use_cache=True, output_hidden_states=True, logits_to_keep=1)
-    set_gpt2_cuda_gelu(model, True)
+    set_route(True)
     custom = model(ids, use_cache=True, output_hidden_states=True, logits_to_keep=1)
     hidden_errors = [(a - b).abs().max().item()
                      for a, b in zip(custom.hidden_states, baseline.hidden_states)]
@@ -53,10 +66,10 @@ def main():
     torch.testing.assert_close(custom.logits, baseline.logits, rtol=1e-3, atol=1e-3)
     logit_error = (custom.logits - baseline.logits).abs().max().item()
     token = baseline.logits[:, -1].argmax(dim=-1, keepdim=True)
-    set_gpt2_cuda_gelu(model, False)
+    set_route(False)
     baseline_next = model(token, past_key_values=baseline.past_key_values,
                           use_cache=True, logits_to_keep=1)
-    set_gpt2_cuda_gelu(model, True)
+    set_route(True)
     custom_next = model(token, past_key_values=custom.past_key_values,
                         use_cache=True, logits_to_keep=1)
     torch.testing.assert_close(custom_next.logits, baseline_next.logits, rtol=1e-3, atol=1e-3)
@@ -67,10 +80,9 @@ def main():
         output = greedy_generate(model, prompt, args.new_tokens)
         return output, tokenizer.decode(output[0], skip_special_tokens=True)
 
-    routes = (("pytorch_gelu", False), ("cuda_gelu", True))
     for index in range(args.warmup):
         for _, enabled in routes:
-            set_gpt2_cuda_gelu(model, enabled)
+            set_route(enabled)
             generate_text(prompt_texts[index % len(prompt_texts)])
 
     samples = {name: [] for name, _ in routes}
@@ -79,19 +91,21 @@ def main():
         outputs = {}
         order = routes if index % 2 == 0 else tuple(reversed(routes))
         for name, enabled in order:
-            set_gpt2_cuda_gelu(model, enabled)
+            set_route(enabled)
             torch.cuda.synchronize()
             start = time.perf_counter()
             outputs[name] = generate_text(text)
             torch.cuda.synchronize()
             samples[name].append((time.perf_counter() - start) * 1000)
-        if (not torch.equal(outputs["pytorch_gelu"][0], outputs["cuda_gelu"][0])
-                or outputs["pytorch_gelu"][1] != outputs["cuda_gelu"][1]):
+        if (not torch.equal(outputs[baseline_name][0], outputs[custom_name][0])
+                or outputs[baseline_name][1] != outputs[custom_name][1]):
             raise AssertionError(f"generated output differs for prompt {index % len(prompt_texts)}")
 
     root = Path(__file__).resolve().parent
     sources = ("benchmark_gelu.py", "gelu_new.py", "csrc/gelu_bindings.cpp",
                "csrc/gelu.cu", "model_demo.py")
+    if args.fused_ln:
+        sources += ("fused_ln.py", "csrc/fused_ln_bindings.cpp", "csrc/fused_ln.cu")
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "torch": torch.__version__, "torch_cuda": torch.version.cuda,
@@ -100,9 +114,10 @@ def main():
         "model_revision": MODEL_REVISION, "weights_sha256": MODEL_WEIGHTS_SHA256,
         "dtype": "float32", "tf32_matmul": False,
         "prompt_lengths": prompt_lengths,
+        "fused_ln_comparison": args.fused_ln,
         "new_tokens": args.new_tokens, "warmup": args.warmup,
         "repeats_per_prompt": args.repeats,
-        "timing": "paired synchronized text-to-text wall time, alternating order; includes tokenization, transfer, generation, decoding; activation swap, model load, warmup excluded",
+        "timing": "paired synchronized text-to-text wall time, alternating order; includes tokenization, transfer, generation, decoding; module swap, model load, warmup excluded",
         "throughput": "end-to-end output tokens/s = new_tokens / complete request seconds; not steady-state decode throughput",
         "intermediate_max_hidden_abs_error": max(hidden_errors),
         "intermediate_max_logit_abs_error": logit_error,

@@ -1,7 +1,8 @@
 # CUDA Attention Engine
 
 A focused C++/CUDA learning and performance project with verified float32
-RMSNorm, causal prompt attention, cached-token attention, and fused GPT-2 GELU
+RMSNorm, causal prompt attention, cached-token attention, fused GPT-2 GELU,
+and an experimental fused residual plus LayerNorm
 on an RTX 4060 Laptop GPU (8 GB). The custom attention paths run inside pinned
 GPT-2; the
 unchanged model is the correctness and latency baseline. The local,
@@ -37,6 +38,7 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark_greedy.py` | Varied-prompt end-to-end greedy generation comparison |
 | `gelu_new.py`, `csrc/gelu*` | Fused CUDA GPT-2 GELU activation and native validation |
 | `test_gelu.py`, `benchmark_gelu.py` | Activation correctness and paired model benchmark |
+| `fused_ln.py`, `csrc/fused_ln*`, `test_fused_ln.py` | Opt-in residual plus LayerNorm kernel and checks |
 | `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
 ## Engineering report (local measurements, 2026-09-29)
@@ -581,6 +583,51 @@ With the same eight-token workload and the new throughput field, a further
 27-pair run measured 54.96 ms / **145.5 output tokens/s** for PyTorch GELU and
 43.08 ms / **185.7 output tokens/s** for custom GELU. Outputs matched exactly;
 custom won 27/27 pairs. Raw samples are in ignored `results/gelu-throughput.json`.
+
+## Fused attention residual and LayerNorm experiment
+
+In each GPT-2 block, the attention output is added to the incoming residual,
+then `ln_2` normalizes the 768-feature result. `csrc/fused_ln.cu` performs both
+steps in one float32 kernel and returns the sum and normalized tensor, since
+the MLP still needs the sum for its own residual. One block handles one token
+row; its 256 threads each hold three values in registers and reduce mean and
+variance with warp shuffles and shared-memory scratch. `fused_ln.py` can
+opt into this GPT-2 block path; the ordinary block method is restored when
+disabled. The benchmark keeps the faster CUDA GELU enabled on both sides and
+uses PyTorch SDPA, so the comparison isolates this additional fusion.
+
+For a decode-shaped `[1,1,768]` tensor, nine paired batches of 100 calls
+measured launch-inclusive medians of 44.60 µs for PyTorch add plus LayerNorm
+and 18.75 µs for the direct native fused call. Complete text-to-text results
+were less stable. Two 27-pair, eight-token runs after the native-call change
+measured **77.20/68.88 ms** PyTorch/fused (23/27 fused wins) and
+**71.71/75.19 ms** (11/27 wins). A 27-pair 16-token run measured
+103.83/101.22 ms (18/27 wins); three longer prompts repeated three times
+measured 46.99/44.28 ms (8/9 wins). Every pair generated identical IDs and
+text. The mixed eight-token reruns do not establish a reliable whole-request
+speedup, so this path remains opt-in. Compilation, model load, warmup, and
+module swapping are outside each timed request.
+After a final input-validation change, another 27-pair eight-token run measured
+50.34/48.66 ms (18/27 wins), with exact IDs and text; its source hashes match
+the committed kernel and adapter. The final ignored report is
+`results/fused-ln-final.json`.
+
+A five-forward cached-token trace at S129 confirmed the intended fusion:
+native LayerNorm calls fell from 25 to 13 per forward, adds from 25 to 13,
+and the new kernel ran 12 times. Cache concatenations stayed at 24, and the
+cuBLAS projections were unchanged. The old add and LayerNorm kernels used
+about 0.128 ms of GPU work per token in this trace; their remaining calls
+plus the fused kernel used about 0.101 ms. This small device-side saving and
+uncontrolled laptop timing explain why the full-request result is uncertain.
+
+At S129, maximum hidden/prompt-logit/cached-logit absolute differences were
+0.00323/9.16e-5/7.63e-5. CPU: one reference test passed, two CUDA cases
+skipped. CUDA: all three tests passed, including a non-default stream and
+native input rejection. Compute Sanitizer memcheck and synccheck reported
+zero errors; targeted racecheck reported zero hazards, errors, and warnings.
+Run `python test_fused_ln.py --cuda` and
+`python benchmark_gelu.py --fused-ln --output results/fused-ln-local.json` from
+the CUDA setup. Raw reports and sanitizer logs are ignored under `results/`.
 
 ## Full-model profiling and CUDA Graph replay
 
