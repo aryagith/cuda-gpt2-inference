@@ -8,6 +8,39 @@ GPT-2; the
 unchanged model is the correctness and latency baseline. The local,
 Git-ignored `PROJECT_PLAN.md` holds the detailed handoff.
 
+## Completed project and recommended route
+
+The bounded learning project is complete as of 2026-09-30. The recommended
+generation route uses the direct greedy loop, fused CUDA GELU, dynamic KV
+caching, and PyTorch efficient SDPA. From the CUDA environment described below:
+
+```text
+python model_demo.py --fast --prompt "The future of GPU computing is" --new-tokens 32
+```
+
+This generates a fixed token count for one unpadded prompt (up to 256 prompt
+tokens, prompt plus output at most 1024). It does not stop early at EOS or
+provide sampling. GPT-2 continues text; it is not an instruction-tuned chatbot.
+Custom attention and fused LayerNorm remain available as measured experiments.
+The project includes independent numerical checks, stream and input-validation
+tests, sanitizer evidence, profiler findings, and paired full-request benchmarks.
+
+A final same-source 27-pair eight-token GELU comparison measured **69.88 ms
+with PyTorch GELU versus 55.45 ms with CUDA GELU**, a 20.6% reduction; throughput
+was **114.5 versus 144.3 output tokens/s**. All generated IDs and text matched.
+This is a local paired result on the recorded laptop, not a portable speed
+guarantee. Native attention remains faster than our prompt kernel in the
+measured large-prompt workload. LayerNorm fusion did not establish a stable
+whole-request gain, and fresh static caching was slower in the final experiment.
+
+Final verification: CPU suites passed nine reference tests and explicitly
+skipped fourteen CUDA cases. Separate CUDA-enabled suites passed all 23 tests,
+including those fourteen CUDA cases; the one- and sixteen-token fast demos
+ran successfully. The final cache checks also exercised one-, eight-, and
+32-token outputs on varied prompt contents and lengths. CUDA sources were
+unchanged from their previously documented sanitizer runs. CPU CI now includes
+all four operator suites; the updated workflow has not been run on GitHub.
+
 ## First operation
 
 For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
@@ -38,6 +71,7 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark_greedy.py` | Varied-prompt end-to-end greedy generation comparison |
 | `gelu_new.py`, `csrc/gelu*` | Fused CUDA GPT-2 GELU activation and native validation |
 | `test_gelu.py`, `benchmark_gelu.py` | Activation correctness and paired model benchmark |
+| `benchmark_cache.py` | Fresh dynamic/static cache correctness, paired request timing, and profiler counts |
 | `fused_ln.py`, `csrc/fused_ln*`, `test_fused_ln.py` | Opt-in residual plus LayerNorm kernel and checks |
 | `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
@@ -631,6 +665,56 @@ the CUDA setup. Raw reports and sanitizer logs are ignored under `results/`.
 
 ## Full-model profiling and CUDA Graph replay
 
+### Final fresh-cache comparison (2026-09-30)
+
+`benchmark_cache.py` compares the same direct loop, CUDA GELU, and efficient
+SDPA with either its dynamic cache or a fresh Transformers `StaticCache`.
+Static capacity is exactly prompt length plus requested output count. Allocation
+and zeroing are included in each request, along with tokenization, transfer,
+prefill, decode, and text decoding. There are no graphs or compilation captures;
+model loading, extension compilation, warmup, and diagnostic profiling are
+outside request timing. Route order alternates, and every pair checks exact
+generated token IDs and decoded text.
+
+| Natural prompt lengths | Output tokens | Pairs | Dynamic ms / tokens/s | Static ms / tokens/s | Static paired wins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 6–10 | 1 | 9 | 7.14 / 140.1 | 10.45 / 95.7 | 0/9 |
+| 6–10 | 8 | 27 | 48.09 / 166.3 | 61.23 / 130.7 | 0/27 |
+| 6–10 | 32 | 27 | 192.97 / 165.8 | 253.00 / 126.5 | 1/27 |
+| 47/84/117 | 32 | 9 | 209.45 / 152.8 | 268.16 / 119.3 | 1/9 |
+
+All pairs matched IDs and text. An earlier run also found static caching slower
+for eight-token, 32-token, and longer-prompt workloads. Absolute latency varied
+between runs; laptop power and thermal conditions were not controlled. Output
+tokens/s here divides output count by complete request time; time to first token
+and inter-token latency are not collected by this benchmark.
+
+A separate eight-token profile counted 193 `aten::cat` calls with dynamic
+caching versus one final output-assembly call with static caching. Static caching
+instead performed 192 indexed writes and 24 zero-buffer allocations. At 32
+tokens, the cat counts were 769 versus one, with 768 static indexed writes.
+Operator counts confirm the intended change, but do not isolate the cost of
+each operation. Extra setup, indexed writes, and masked fixed-capacity attention
+are candidate costs; the timings establish the overall regression, not their
+individual contributions. Dynamic caching remains the recommended request route.
+The experiment does not establish that other preallocated-cache designs or
+reused server buffers would lose; a custom cache kernel is not justified by
+this comparison alone.
+
+```text
+python benchmark_cache.py --new-tokens 8 --output results/cache-eight.json
+python benchmark_cache.py --new-tokens 32 --output results/cache-thirtytwo.json
+python benchmark_cache.py --new-tokens 32 --prompts-file prompts.txt --output results/cache-varied.json
+```
+
+For the last command, create a file containing one natural, unpadded prompt per
+line (each at most 256 tokens). Reports retain prompt text, all samples, source
+hashes, device/runtime metadata, and incremental peak allocated memory. Final
+local evidence remains ignored under `results/cache-final-*.json` and
+`results/gelu-final.json`; GPU checks and demo logs are `results/final-*.log`.
+
+### Earlier graph experiment
+
 Profiling five complete GPT-2 cached-token forwards after a 129-token prefill
 showed **1,290 GPU kernel launches**, or 258 per token. CUDA kernels occupied
 about 2.96 ms per forward in that trace; ordinary synchronized model forwards
@@ -647,10 +731,10 @@ After fused GELU, a new five-forward S129 cached-token profile with
 about 1.75 ms and 0.72 ms of GPU work per forward in that instrumented run.
 Efficient attention used about 0.40 ms. Each forward also invoked 25 native
 LayerNorm operations, 25 residual/embedding adds, and 24 cache concatenations.
-The next bounded custom-kernel experiment is to fuse each attention residual
-add with the following `ln_2` LayerNorm, returning both the summed residual
-and normalized value. This could remove 12 small launches per cached token;
-a whole-request paired benchmark must establish whether it actually helps.
+The residual plus `ln_2` fusion experiment described above removed 12 small
+launches per cached token, but its whole-request gain was not stable. The
+final cache experiment reported here tested the remaining concatenations and retained
+dynamic caching based on full-request measurements.
 The ignored profile is `results/profile-gelu-token.json`. Profiler timing is
 diagnostic and should not be compared directly with unprofiled latency.
 

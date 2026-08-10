@@ -11,7 +11,7 @@ import time
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import AutoModelForCausalLM, AutoTokenizer, AttentionInterface, AttentionMaskInterface
+from transformers import AutoModelForCausalLM, AutoTokenizer, AttentionInterface, AttentionMaskInterface, StaticCache
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import sdpa_mask
 
@@ -154,18 +154,27 @@ def generate(model, tokenizer, ids, new_tokens, implementation):
 
 
 @torch.inference_mode()
-def greedy_generate(model, ids, new_tokens):
-    """Fixed-count greedy generation with the existing PyTorch SDPA and KV cache."""
+def greedy_generate(model, ids, new_tokens, *, static_cache=False):
+    """Fixed-count greedy generation; optionally preallocate a fresh request cache."""
     if new_tokens < 1 or ids.shape[1] + new_tokens > model.config.n_positions:
         raise ValueError("new_tokens must be positive and fit GPT-2's position limit")
     model.set_attn_implementation("sdpa")
+    cache_args = {}
+    if static_cache:
+        positions = torch.arange(ids.shape[1] + new_tokens, device=ids.device)
+        cache_args = {"past_key_values": StaticCache(
+            config=model.config, max_cache_len=ids.shape[1] + new_tokens),
+            "cache_position": positions[:ids.shape[1]]}
     with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-        output = model(ids, use_cache=True, logits_to_keep=1)
+        output = model(ids, use_cache=True, logits_to_keep=1, **cache_args)
         cache = output.past_key_values
         token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
         tokens = [token]
-        for _ in range(new_tokens - 1):
-            output = model(token, past_key_values=cache, use_cache=True, logits_to_keep=1)
+        for index in range(new_tokens - 1):
+            position_args = ({"cache_position": positions[ids.shape[1] + index:ids.shape[1] + index + 1]}
+                             if static_cache else {})
+            output = model(token, past_key_values=cache, use_cache=True, logits_to_keep=1,
+                           **position_args)
             cache = output.past_key_values
             token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
             tokens.append(token)
@@ -267,6 +276,8 @@ def main():
     parser.add_argument("--prompt", default="The future of GPU computing is")
     parser.add_argument("--lengths", default="17,129,256", help="comma-separated prefill token lengths")
     parser.add_argument("--new-tokens", type=int, default=8)
+    parser.add_argument("--fast", action="store_true",
+                        help="generate once with direct greedy decoding, CUDA GELU, dynamic cache, and PyTorch SDPA")
     parser.add_argument("--generation-length", type=int,
                         help="repeat/truncate prompt tokens to this length for generation (1..256)")
     parser.add_argument("--warmup", type=int, default=3)
@@ -286,6 +297,14 @@ def main():
     prompt_ids = input_ids(tokenizer, args.prompt, args.generation_length)
     if prompt_ids.shape[1] + args.new_tokens > model.config.n_positions:
         parser.error("prompt plus generated tokens exceeds GPT-2's 1024 positions")
+    if args.fast:
+        from gelu_new import set_gpt2_cuda_gelu
+        set_gpt2_cuda_gelu(model, True)
+        generated = greedy_generate(model, prompt_ids, args.new_tokens)
+        print(json.dumps({"route": "direct greedy, CUDA GELU, dynamic cache, efficient SDPA",
+                          "prompt_tokens": prompt_ids.shape[1], "new_tokens": args.new_tokens,
+                          "text": tokenizer.decode(generated[0], skip_special_tokens=True)}, indent=2))
+        return
     generated_baseline, _ = generate(model, tokenizer, prompt_ids, args.new_tokens, "sdpa")
     generated_custom, generation_calls = generate(model, tokenizer, prompt_ids, args.new_tokens, ATTENTION_NAME)
     if generation_calls["single_query_tiled"] + generation_calls["query_tiled"] != 12:
