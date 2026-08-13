@@ -2,7 +2,7 @@
 
 A focused C++/CUDA learning and performance project with verified float32
 RMSNorm, causal prompt attention, cached-token attention, fused GPT-2 GELU,
-and an experimental fused residual plus LayerNorm
+an experimental fused residual plus LayerNorm, and optional FP16 model/GELU support
 on an RTX 4060 Laptop GPU (8 GB). The custom attention paths run inside pinned
 GPT-2; the
 unchanged model is the correctness and latency baseline. The local,
@@ -17,6 +17,10 @@ caching, and PyTorch efficient SDPA. From the CUDA environment described below:
 ```text
 python model_demo.py --fast --prompt "The future of GPU computing is" --new-tokens 32
 ```
+
+The default remains float32. Add `--dtype float16` to use the verified FP16
+model and GELU path described in the precision experiment below; it halves
+parameter storage, while the latency advantage over optimized FP32 is workload-dependent.
 
 This generates a fixed token count for one unpadded prompt (up to 256 prompt
 tokens, prompt plus output at most 1024). It does not stop early at EOS or
@@ -72,6 +76,7 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `gelu_new.py`, `csrc/gelu*` | Fused CUDA GPT-2 GELU activation and native validation |
 | `test_gelu.py`, `benchmark_gelu.py` | Activation correctness and paired model benchmark |
 | `benchmark_cache.py` | Fresh dynamic/static cache correctness, paired request timing, and profiler counts |
+| `benchmark_precision.py` | Four-route FP32/FP16 comparison, latency percentiles, token readiness, memory, and GPU telemetry |
 | `fused_ln.py`, `csrc/fused_ln*`, `test_fused_ln.py` | Opt-in residual plus LayerNorm kernel and checks |
 | `graph_generation.py` | Fixed-length CUDA Graph generation and paired model benchmark |
 
@@ -617,6 +622,94 @@ With the same eight-token workload and the new throughput field, a further
 27-pair run measured 54.96 ms / **145.5 output tokens/s** for PyTorch GELU and
 43.08 ms / **185.7 output tokens/s** for custom GELU. Outputs matched exactly;
 custom won 27/27 pairs. Raw samples are in ignored `results/gelu-throughput.json`.
+
+## FP16 GELU and precision comparison (2026-09-30)
+
+`model_demo.py --fast --dtype float16` loads the same pinned GPT-2 weights in
+half precision and uses PyTorch efficient SDPA with the direct greedy loop.
+RMSNorm, custom attention, and fused LayerNorm retain their float32 contracts.
+Only custom GELU adds float16 support. The templated kernel reads/writes half
+values, computes each operation in float, and explicitly preserves the half
+rounding points of Transformers' native `NewGELUActivation`, including the
+rounded square inside the cubic calculation. The float32 route retains its
+original fused arithmetic.
+
+An initial round-at-output-only implementation changed one prompt's continuation.
+The final implementation matches native half GELU bit-for-bit on **all 63,488
+finite FP16 bit patterns** in the tested PyTorch build, including signed zero
+and subnormals. Tests also compare against a float64 formula oracle with a
+documented tolerance for inherited native-half rounding error; the native-half
+comparison itself allows zero error. CUDA stream, odd length, prompt/decode/batch,
+extreme finite inputs, and native input rejection checks passed. CPU: one GELU
+reference pass, three GPU skips. CUDA-enabled GELU suite: all four tests passed.
+Targeted memcheck/synccheck each reported zero errors. The full test-suite
+racecheck completed its tests but stalled during shutdown and was terminated;
+a focused FP32/FP16 kernel probe then completed with zero hazards, errors,
+or warnings. These sanitizer runs target `gelu_new_kernel`; racecheck examines
+shared-memory hazards, and this kernel uses no shared memory.
+
+The new benchmark compares four resident routes on identical natural prompts,
+rotates/reverses execution order, and includes tokenization, input transfer,
+dynamic cache setup, prefill, decoding, and text decoding. Module swaps, loading,
+compilation, warmup, GPU-state snapshots, and separate token diagnostics are
+outside request timing. There is no graph capture. For nine 6–10-token prompts,
+three passes each, and 32 output tokens (27 paired samples per route):
+
+| Route | Median request ms | p95 request ms | Median output tokens/s |
+| --- | ---: | ---: | ---: |
+| FP32, native GELU | 247.57 | 332.43 | 129.3 |
+| FP32, CUDA GELU | 218.81 | 338.55 | 146.2 |
+| FP16, native GELU | 250.45 | 361.64 | 127.8 |
+| FP16, CUDA GELU | 191.98 | 245.16 | 166.7 |
+
+FP16 CUDA GELU reduced median request time **23.3% versus native FP16 GELU**
+and won 26/27 pairs. Eight-token outputs measured 68.97/54.61 ms native/custom
+FP16 (20.8% lower, 27/27 wins). Three natural 47/84/117-token prompts with 32
+outputs measured 233.82/180.85 ms (22.7% lower, 9/9 wins). The one-token smoke
+also passed. Within each precision, native and custom routes matched generated
+IDs/text on every measured pair; FP16 teacher-forced logits were exactly equal
+between native and custom GELU. Cross-precision equality is not guaranteed:
+two of the nine short prompts produced different 32-token continuations in FP16
+versus FP32, while all eight-token and longer-prompt comparisons matched.
+
+Parameter storage fell from **474.70 MiB to 237.35 MiB**. For the 32-token short
+requests, maximum incremental allocated peak fell from 3,444,736 bytes to
+1,731,072 bytes. Both model precisions were resident for the paired comparison;
+incremental peaks exclude that resident baseline, and parameter bytes exclude
+buffers and allocator reservations. These are not whole-process VRAM totals.
+
+The precision change alone did not establish a reliable latency win: native
+FP16 lost 15/27 pairs to native FP32 in the 32-token run. With custom GELU,
+FP16 won 17/27 short 32-token pairs but only 15/27 eight-token pairs, and the
+long-prompt median was nearly identical to optimized FP32 (180.85/180.53 ms).
+Keep FP16 opt-in for memory savings and precision experiments. Clock snapshots
+varied substantially (for example, 1890–2565 MHz SM clocks in the 32-token run);
+power and thermal conditions were recorded, not controlled. Teacher-forced
+logits versus FP32 differed by up to 0.448, and prompt NLL drift by up to 0.0155;
+these few prompts are a numerical diagnostic, not a model-quality evaluation.
+
+Separate CUDA-event diagnostics mark GPU argmax completion without synchronizing
+after every token. The 32-token FP16 CUDA route measured median first-token
+device readiness 7.10 ms and inter-token device gap 5.51 ms. These include host
+enqueue gaps and differ from user-delivered streaming TTFT/latency: first-token
+detokenization and network delivery are excluded. They come from one separately
+instrumented pass per prompt; they should not be summed to reconstruct the
+uninstrumented request median. For one output token the inter-token field is
+null. p95 uses nearest rank and is coarse at these sample counts; raw samples
+are retained alongside telemetry, source hashes, memory, and numerical checks.
+
+```text
+python test_gelu.py --cuda
+python model_demo.py --fast --dtype float16 --new-tokens 32
+python benchmark_precision.py --new-tokens 8 --output results/precision-eight.json
+python benchmark_precision.py --new-tokens 32 --output results/precision-thirtytwo.json
+```
+
+Use `--prompts-file prompts.txt` for one natural prompt per line, subject to the
+existing 256-token prompt limit. Local evidence is ignored under
+`results/precision-final-*.json`, `results/precision-final-cuda.log`,
+`results/precision-{memcheck,synccheck,racecheck-focused}.log`. The exploratory
+`results/precision-8.json` precedes the rounding correction and is not final evidence.
 
 ## Fused attention residual and LayerNorm experiment
 

@@ -62,7 +62,9 @@ def single_prompt_attention(module, query, key, value, attention_mask, **kwargs)
     return prompt_attention(module, query, key, value, attention_mask, force_single=True, **kwargs)
 
 
-def load_model():
+def load_model(dtype=torch.float32):
+    if dtype not in (torch.float32, torch.float16):
+        raise ValueError("only float32 and float16 GPT-2 loading is supported")
     if not (MODEL_DIR / "model.safetensors").is_file():
         raise RuntimeError("Download the pinned GPT-2 snapshot into models/gpt2; see README.md")
     with (MODEL_DIR / "model.safetensors").open("rb") as weights:
@@ -74,7 +76,7 @@ def load_model():
     AttentionMaskInterface.register(SINGLE_ATTENTION_NAME, sdpa_mask)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_DIR, local_files_only=True, use_safetensors=True, dtype=torch.float32,
+        MODEL_DIR, local_files_only=True, use_safetensors=True, dtype=dtype,
         attn_implementation="sdpa").eval().to("cuda")
     config = model.config
     if (config.n_layer, config.n_head, config.n_embd, config.n_positions) != (12, 12, 768, 1024):
@@ -154,10 +156,12 @@ def generate(model, tokenizer, ids, new_tokens, implementation):
 
 
 @torch.inference_mode()
-def greedy_generate(model, ids, new_tokens, *, static_cache=False):
+def greedy_generate(model, ids, new_tokens, *, static_cache=False, token_events=None):
     """Fixed-count greedy generation; optionally preallocate a fresh request cache."""
     if new_tokens < 1 or ids.shape[1] + new_tokens > model.config.n_positions:
         raise ValueError("new_tokens must be positive and fit GPT-2's position limit")
+    if token_events is not None and len(token_events) != new_tokens:
+        raise ValueError("provide one CUDA timing event per generated token")
     model.set_attn_implementation("sdpa")
     cache_args = {}
     if static_cache:
@@ -169,6 +173,8 @@ def greedy_generate(model, ids, new_tokens, *, static_cache=False):
         output = model(ids, use_cache=True, logits_to_keep=1, **cache_args)
         cache = output.past_key_values
         token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
+        if token_events is not None:
+            token_events[0].record()
         tokens = [token]
         for index in range(new_tokens - 1):
             position_args = ({"cache_position": positions[ids.shape[1] + index:ids.shape[1] + index + 1]}
@@ -177,6 +183,8 @@ def greedy_generate(model, ids, new_tokens, *, static_cache=False):
                            **position_args)
             cache = output.past_key_values
             token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
+            if token_events is not None:
+                token_events[index + 1].record()
             tokens.append(token)
     return torch.cat([ids, *tokens], dim=1)
 
@@ -278,6 +286,8 @@ def main():
     parser.add_argument("--new-tokens", type=int, default=8)
     parser.add_argument("--fast", action="store_true",
                         help="generate once with direct greedy decoding, CUDA GELU, dynamic cache, and PyTorch SDPA")
+    parser.add_argument("--dtype", choices=("float32", "float16"), default="float32",
+                        help="float16 is supported by the --fast generation route")
     parser.add_argument("--generation-length", type=int,
                         help="repeat/truncate prompt tokens to this length for generation (1..256)")
     parser.add_argument("--warmup", type=int, default=3)
@@ -291,8 +301,10 @@ def main():
         parser.error("lengths/generation-length must be 1..256, and new-tokens/warmup/repeats positive")
     if not torch.cuda.is_available():
         parser.error("a CUDA-enabled PyTorch build is required")
+    if args.dtype == "float16" and not args.fast:
+        parser.error("--dtype float16 requires --fast; custom attention verification remains float32")
     torch.backends.cuda.matmul.allow_tf32 = False
-    tokenizer, model = load_model()
+    tokenizer, model = load_model(getattr(torch, args.dtype))
     loaded_model_allocated = torch.cuda.memory_allocated()
     prompt_ids = input_ids(tokenizer, args.prompt, args.generation_length)
     if prompt_ids.shape[1] + args.new_tokens > model.config.n_positions:
@@ -302,6 +314,7 @@ def main():
         set_gpt2_cuda_gelu(model, True)
         generated = greedy_generate(model, prompt_ids, args.new_tokens)
         print(json.dumps({"route": "direct greedy, CUDA GELU, dynamic cache, efficient SDPA",
+                          "dtype": args.dtype,
                           "prompt_tokens": prompt_ids.shape[1], "new_tokens": args.new_tokens,
                           "text": tokenizer.decode(generated[0], skip_special_tokens=True)}, indent=2))
         return

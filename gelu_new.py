@@ -1,4 +1,4 @@
-"""Forward-only float32 CUDA implementation of GPT-2's gelu_new activation."""
+"""Forward-only float32/float16 GPT-2 GELU, with float32 CUDA arithmetic."""
 
 from functools import lru_cache
 import math
@@ -31,8 +31,8 @@ def extension():
 
 
 def cuda_gelu_new(x):
-    if not x.is_cuda or x.dtype != torch.float32 or not x.is_contiguous() or x.numel() == 0:
-        raise ValueError("expected a nonempty contiguous float32 CUDA tensor")
+    if not x.is_cuda or x.dtype not in (torch.float32, torch.float16) or not x.is_contiguous() or x.numel() == 0:
+        raise ValueError("expected a nonempty contiguous float32 or float16 CUDA tensor")
     if x.requires_grad:
         raise ValueError("forward-only operator; detach inputs for inference")
     return extension().gelu_new(x)

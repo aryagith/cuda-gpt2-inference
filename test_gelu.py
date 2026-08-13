@@ -48,11 +48,43 @@ class CudaTests(unittest.TestCase):
     def test_native_rejection(self):
         module = extension()
         x = torch.ones(2, 4, device="cuda")
-        cases = (x.cpu(), x.double(), x.t(), x.clone().requires_grad_(), x[:0])
+        cases = (x.cpu(), x.double(), x.bfloat16(), x.int(), x.t(), x.clone().requires_grad_(), x[:0])
         for value in cases:
             with self.subTest(shape=value.shape, dtype=value.dtype):
                 with self.assertRaises(RuntimeError):
                     module.gelu_new(value)
+
+    def test_float16_oracle_and_stream(self):
+        generator = torch.Generator(device="cuda").manual_seed(17)
+        stream = torch.cuda.Stream()
+        for shape in ((1,), (257,), (1, 1, 3072), (2, 129, 3072)):
+            x = (torch.randn(shape, device="cuda", generator=generator) * 5).half()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                actual = cuda_gelu_new(x)
+            torch.cuda.current_stream().wait_stream(stream)
+            self.assertEqual(actual.dtype, torch.float16)
+            # Native half rounds between eager operations; fusion preserves
+            # those rounding points so this comparison is bit-exact.
+            torch.testing.assert_close(actual, NewGELUActivation()(x), rtol=0, atol=0)
+            # Half intermediates can lose low bits or cancel near negative tails.
+            # About two half machine epsilons relative, plus 0.002 absolute,
+            # cover this inherited rounding error.
+            expected = NewGELUActivation()(x.double()).half()
+            torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+        x = torch.tensor([-65504, -100, -20, -1e-3, 0, 1e-3, 20, 100, 65504],
+                         dtype=torch.float16, device="cuda")
+        torch.testing.assert_close(cuda_gelu_new(x), NewGELUActivation()(x.double()).half(),
+                                   rtol=2e-3, atol=2e-3)
+        # Every finite half bit pattern: verify rounding semantics beyond a
+        # random sample, including signed zero and subnormal values.
+        patterns = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16).view(torch.float16)
+        finite = patterns[torch.isfinite(patterns)]
+        torch.testing.assert_close(cuda_gelu_new(finite).view(torch.int16),
+                                   NewGELUActivation()(finite).view(torch.int16), rtol=0, atol=0)
+        for invalid in (x.cpu(), x[:0], x.clone().requires_grad_()):
+            with self.assertRaises(RuntimeError):
+                extension().gelu_new(invalid)
 
 
 if __name__ == "__main__":
