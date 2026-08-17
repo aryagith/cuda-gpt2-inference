@@ -4,20 +4,22 @@ at::Tensor attention_cuda(const at::Tensor& q, const at::Tensor& k, const at::Te
 at::Tensor attention_tiled_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v);
 at::Tensor attention_query_tiled_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v);
 at::Tensor attention_decode_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v);
+at::Tensor attention_tensor_core_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v);
 
-void validate(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+void validate(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, bool tiled = false,
+              at::ScalarType dtype = at::kFloat) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "expected CUDA tensors");
     TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "Q/K/V must share a device");
-    TORCH_CHECK(q.scalar_type() == at::kFloat && k.scalar_type() == at::kFloat && v.scalar_type() == at::kFloat,
-                "only float32 is supported");
+    TORCH_CHECK(q.scalar_type() == dtype && k.scalar_type() == dtype && v.scalar_type() == dtype,
+                "unsupported Q/K/V dtype");
     TORCH_CHECK(q.dim() == 4 && q.sizes().vec() == k.sizes().vec() && q.sizes().vec() == v.sizes().vec(),
                 "expected matching Q/K/V [batch, heads, sequence, head_dim]");
     TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 && q.size(3) > 0,
                 "dimensions must be positive");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "Q/K/V must be contiguous");
     TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(), "forward-only operator");
-    TORCH_CHECK(q.size(2) <= 256 && q.size(3) <= 128 && q.numel() <= 16 * 1024 * 1024
-                && q.numel() / q.size(3) * q.size(2) <= 16 * 1024 * 1024,
+    TORCH_CHECK(q.size(2) <= (tiled ? 1024 : 256) && q.size(3) <= 128 && q.numel() <= 16 * 1024 * 1024
+                && (tiled || q.numel() / q.size(3) * q.size(2) <= 16 * 1024 * 1024),
                 "baseline workload exceeds sequence, head dimension, or buffer limit");
 }
 
@@ -27,13 +29,19 @@ at::Tensor attention(const at::Tensor& q, const at::Tensor& k, const at::Tensor&
 }
 
 at::Tensor attention_tiled(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
-    validate(q, k, v);
+    validate(q, k, v, true);
     return attention_tiled_cuda(q, k, v);
 }
 
 at::Tensor attention_query_tiled(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
-    validate(q, k, v);
+    validate(q, k, v, true);
     return attention_query_tiled_cuda(q, k, v);
+}
+
+at::Tensor attention_tensor_core(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+    validate(q, k, v, true, at::kHalf);
+    TORCH_CHECK(q.size(3) == 64, "Tensor Core attention requires head_dim=64");
+    return attention_tensor_core_cuda(q, k, v);
 }
 
 at::Tensor attention_decode(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
@@ -54,8 +62,9 @@ at::Tensor attention_decode(const at::Tensor& q, const at::Tensor& k, const at::
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("attention_tensor_core", &attention_tensor_core, "Forward FP16 Tensor Core attention, head_dim=64");
     module.def("attention", &attention, "Forward float32 causal attention baseline");
     module.def("attention_tiled", &attention_tiled, "Forward float32 causal attention with online softmax");
-    module.def("attention_query_tiled", &attention_query_tiled, "Forward float32 attention with four-query tiles");
+    module.def("attention_query_tiled", &attention_query_tiled, "Forward float32 attention with eight-query tiles");
     module.def("attention_decode", &attention_decode, "Forward float32 attention over a K/V cache");
 }

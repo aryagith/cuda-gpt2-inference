@@ -8,7 +8,7 @@
 namespace {
 constexpr int threads = 256;
 constexpr int tile_keys = 32;
-constexpr int tile_queries = 4;
+constexpr int tile_queries = 8;
 constexpr int max_head_dim = 128;
 
 __global__ void scores_kernel(const float* q, const float* k, float* scores,
@@ -125,9 +125,11 @@ __global__ void tiled_kernel(const float* q, const float* k, const float* v, flo
         out[q_offset + dim] = numerator / denominator;
 }
 
-// Four warps handle four queries while sharing each coalesced K/V tile.
+// Eight warps handle eight queries while sharing each coalesced K/V tile.
+template<int tile_head_dim>
 __global__ void query_tiled_kernel(const float* q, const float* k, const float* v, float* out,
-                                   int sequence, int head_dim) {
+                                   int sequence, int input_head_dim) {
+    const int head_dim = tile_head_dim == 64 ? 64 : input_head_dim;
     const int lane = threadIdx.x;
     const int row = threadIdx.y;
     const int thread = row * tile_keys + lane;
@@ -138,24 +140,20 @@ __global__ void query_tiled_kernel(const float* q, const float* k, const float* 
     const int64_t pair = blockIdx.x / query_blocks;
     const int64_t pair_offset = pair * sequence * head_dim;
 
-    __shared__ float q_tile[tile_queries * max_head_dim];
-    __shared__ float k_tile[tile_keys * max_head_dim];
-    __shared__ float v_tile[tile_keys * max_head_dim];
-    __shared__ float scores[tile_queries * tile_keys];
+    __shared__ float q_tile[tile_queries * tile_head_dim];
+    __shared__ float k_tile[tile_keys * tile_head_dim];
+    __shared__ float v_tile[tile_keys * tile_head_dim];
     __shared__ float weights[tile_queries * tile_keys];
-    __shared__ float maximum[tile_queries], denominator[tile_queries], rescale[tile_queries];
     for (int index = thread; index < tile_queries * head_dim; index += tile_queries * tile_keys) {
         const int q_row = index / head_dim;
         if (query_base + q_row < sequence)
             q_tile[index] = q[pair_offset + (query_base + q_row) * head_dim + index % head_dim];
     }
-    if (lane == 0) {
-        maximum[row] = -CUDART_INF_F;
-        denominator[row] = 0.0f;
-    }
     __syncthreads();
 
-    float numerator[max_head_dim / tile_keys] = {0.0f};
+    float maximum = -CUDART_INF_F;
+    float denominator = 0.0f;
+    float numerator[tile_head_dim / tile_keys] = {0.0f};
     for (int start = 0; start <= max_query; start += tile_keys) {
         const int key_count = min(tile_keys, sequence - start);
         for (int index = thread; index < key_count * head_dim; index += tile_queries * tile_keys) {
@@ -168,36 +166,35 @@ __global__ void query_tiled_kernel(const float* q, const float* k, const float* 
 
         const int valid = query < sequence && query >= start
             ? min(key_count, query - start + 1) : 0;
-        if (lane < valid) {
-            float dot = 0.0f;
-            for (int dim = 0; dim < head_dim; ++dim)
-                dot += q_tile[row * head_dim + dim] * k_tile[dim * tile_keys + lane];
-            scores[row * tile_keys + lane] = dot * rsqrtf(static_cast<float>(head_dim));
-        }
-        __syncthreads();
-
-        if (lane == 0 && valid > 0) {
-            float tile_maximum = -CUDART_INF_F;
-            for (int key = 0; key < valid; ++key)
-                tile_maximum = fmaxf(tile_maximum, scores[row * tile_keys + key]);
-            const float next_maximum = fmaxf(maximum[row], tile_maximum);
-            rescale[row] = maximum[row] == -CUDART_INF_F ? 0.0f : expf(maximum[row] - next_maximum);
-            float tile_denominator = 0.0f;
-            for (int key = 0; key < valid; ++key) {
-                const float weight = expf(scores[row * tile_keys + key] - next_maximum);
-                weights[row * tile_keys + key] = weight;
-                tile_denominator += weight;
-            }
-            denominator[row] = denominator[row] * rescale[row] + tile_denominator;
-            maximum[row] = next_maximum;
-        }
-        __syncthreads();
-
+        // Every lane owns one key score. All 32 lanes participate in reductions,
+        // including masked keys; valid is uniform within this query's warp.
         if (valid > 0) {
-            for (int part = 0; part < max_head_dim / tile_keys; ++part) {
+            float score = -CUDART_INF_F;
+            if (lane < valid) {
+                float dot = 0.0f;
+                for (int dim = 0; dim < head_dim; ++dim)
+                    dot += q_tile[row * head_dim + dim] * k_tile[dim * tile_keys + lane];
+                score = dot * rsqrtf(static_cast<float>(head_dim));
+            }
+            float tile_maximum = score;
+            for (int offset = tile_keys / 2; offset > 0; offset /= 2)
+                tile_maximum = fmaxf(tile_maximum, __shfl_xor_sync(0xffffffff, tile_maximum, offset));
+            const float next_maximum = fmaxf(maximum, tile_maximum);
+            const float rescale = maximum == -CUDART_INF_F ? 0.0f : expf(maximum - next_maximum);
+            const float weight = lane < valid ? expf(score - next_maximum) : 0.0f;
+            weights[row * tile_keys + lane] = weight;
+            float tile_denominator = weight;
+            for (int offset = tile_keys / 2; offset > 0; offset /= 2)
+                tile_denominator += __shfl_xor_sync(0xffffffff, tile_denominator, offset);
+            denominator = denominator * rescale + tile_denominator;
+            maximum = next_maximum;
+            // Other lanes read this warp's weights below. No warp reads another
+            // query's weights, so only warp synchronization is needed here.
+            __syncwarp();
+            for (int part = 0; part < tile_head_dim / tile_keys; ++part) {
                 const int dim = lane + part * tile_keys;
                 if (dim < head_dim) {
-                    numerator[part] *= rescale[row];
+                    numerator[part] *= rescale;
                     for (int key = 0; key < valid; ++key)
                         numerator[part] += weights[row * tile_keys + key] * v_tile[key * head_dim + dim];
                 }
@@ -206,10 +203,10 @@ __global__ void query_tiled_kernel(const float* q, const float* k, const float* 
         __syncthreads();
     }
     if (query < sequence) {
-        for (int part = 0; part < max_head_dim / tile_keys; ++part) {
+        for (int part = 0; part < tile_head_dim / tile_keys; ++part) {
             const int dim = lane + part * tile_keys;
             if (dim < head_dim)
-                out[pair_offset + query * head_dim + dim] = numerator[part] / denominator[row];
+                out[pair_offset + query * head_dim + dim] = numerator[part] / denominator;
         }
     }
 }
@@ -306,8 +303,12 @@ at::Tensor attention_query_tiled_cuda(const at::Tensor& q, const at::Tensor& k, 
     auto out = at::empty_like(q);
     const auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
     const int query_blocks = (sequence + tile_queries - 1) / tile_queries;
-    query_tiled_kernel<<<q.size(0) * q.size(1) * query_blocks, dim3(tile_keys, tile_queries), 0, stream.stream()>>>(
-        q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), out.data_ptr<float>(), sequence, head_dim);
+    if (head_dim == 64)
+        query_tiled_kernel<64><<<q.size(0) * q.size(1) * query_blocks, dim3(tile_keys, tile_queries), 0, stream.stream()>>>(
+            q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), out.data_ptr<float>(), sequence, head_dim);
+    else
+        query_tiled_kernel<128><<<q.size(0) * q.size(1) * query_blocks, dim3(tile_keys, tile_queries), 0, stream.stream()>>>(
+            q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(), out.data_ptr<float>(), sequence, head_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

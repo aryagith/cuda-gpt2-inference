@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from attention import (cuda_attention, cuda_attention_tiled, cuda_attention_query_tiled,
-                       cuda_attention_decode, extension, reference, reference_decode)
+                       cuda_attention_decode, cuda_attention_tensor_core, extension, reference, reference_decode)
 
 CUSTOM = (cuda_attention, cuda_attention_tiled, cuda_attention_query_tiled)
 
@@ -22,9 +22,15 @@ def math_sdpa(q, k, v):
 
 
 class ReferenceTests(unittest.TestCase):
+    def test_tensor_core_requires_half_cuda_and_64_width(self):
+        for q in (torch.ones(1, 1, 4, 64), torch.ones(1, 1, 4, 64).half(),
+                  torch.ones(1, 1, 4, 32).half()):
+            with self.assertRaises(ValueError):
+                cuda_attention_tensor_core(q, q, q)
+
     def test_against_math_sdpa(self):
         generator = torch.Generator().manual_seed(42)
-        for shape in ((1, 1, 1, 1), (1, 2, 7, 16), (2, 3, 33, 32)):
+        for shape in ((1, 1, 1, 1), (1, 2, 7, 16), (2, 3, 33, 32), (1, 1, 257, 16)):
             with self.subTest(shape=shape):
                 q, k, v = (torch.randn(shape, generator=generator) for _ in range(3))
                 torch.testing.assert_close(reference(q, k, v), math_sdpa(q, k, v), rtol=2e-5, atol=2e-6)
@@ -42,7 +48,7 @@ class ReferenceTests(unittest.TestCase):
         cases = ((q.double(), q, q), (q, q[:, :, :2], q),
                  (q.transpose(-1, -2), q.transpose(-1, -2), q.transpose(-1, -2)),
                  (q.clone().requires_grad_(), q, q),
-                 (torch.ones(1, 1, 257, 8),) * 3,
+                 (torch.ones(1, 1, 1025, 8),) * 3,
                  (torch.ones(1, 1, 4, 129),) * 3)
         for args in cases:
             with self.subTest(shape=args[0].shape, dtype=args[0].dtype):
@@ -165,7 +171,7 @@ class CudaTests(unittest.TestCase):
         cases = ((q.double(), q, q), (q, q[:, :, :2], q),
                  (q.transpose(-1, -2),) * 3,
                  (q.clone().requires_grad_(), q, q),
-                 (torch.ones(1, 1, 257, 8, device="cuda"),) * 3,
+                 (torch.ones(1, 1, 1025, 8, device="cuda"),) * 3,
                  (q, q.cpu(), q),
                  (q.cpu(),) * 3)
         for args in cases:
@@ -173,6 +179,59 @@ class CudaTests(unittest.TestCase):
                 for binding in (module.attention, module.attention_tiled, module.attention_query_tiled):
                     with self.assertRaises(RuntimeError):
                         binding(*args)
+        longer = torch.ones(1, 1, 257, 8, device="cuda")
+        with self.assertRaises(RuntimeError):
+            module.attention(longer, longer, longer)
+        with self.assertRaises(ValueError):
+            cuda_attention(longer, longer, longer)
+
+    def test_long_prefill(self):
+        torch.manual_seed(44)
+        extension()
+        stream = torch.cuda.Stream()
+        for shape in ((1, 2, 257, 65), (2, 3, 513, 32), (1, 2, 67, 64),
+                      (1, 12, 992, 64), (1, 1, 1024, 128)):
+            with self.subTest(shape=shape), torch.cuda.stream(stream):
+                q, k, v = (torch.randn(shape, device="cuda") for _ in range(3))
+                expected = reference(q, k, v)
+                precise = math_sdpa(q.double(), k.double(), v.double())
+                for implementation in (cuda_attention_tiled, cuda_attention_query_tiled):
+                    actual = implementation(q, k, v)
+                    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+                    torch.testing.assert_close(actual.double(), precise, rtol=2e-4, atol=2e-5)
+                    changed = v.clone()
+                    changed[:, :, -1] = 1e5
+                    torch.testing.assert_close(actual[:, :, :-1],
+                        implementation(q, k, changed)[:, :, :-1], rtol=0, atol=0)
+            stream.synchronize()
+
+    def test_tensor_core(self):
+        torch.manual_seed(73)
+        module = extension()
+        stream = torch.cuda.Stream()
+        for sequence in (1, 15, 16, 17, 67, 257, 513, 992, 1024):
+            with self.subTest(sequence=sequence), torch.cuda.stream(stream):
+                q, k, v = (torch.randn(2, 2, sequence, 64, device="cuda", dtype=torch.float16)
+                           for _ in range(3))
+                actual = cuda_attention_tensor_core(q, k, v)
+                expected = math_sdpa(q.double(), k.double(), v.double())
+                torch.testing.assert_close(actual.double(), expected, rtol=1e-2, atol=3e-3)
+                changed = v.clone()
+                changed[:, :, -1] = 1000
+                torch.testing.assert_close(actual[:, :, :-1],
+                    cuda_attention_tensor_core(q, k, changed)[:, :, :-1], rtol=0, atol=0)
+                if sequence == 67:
+                    precise = math_sdpa((q * 20).double(), (k * 20).double(), v.double())
+                    torch.testing.assert_close(cuda_attention_tensor_core(q * 20, k * 20, v).double(),
+                                               precise, rtol=1e-2, atol=3e-3)
+            stream.synchronize()
+        q = torch.ones(1, 1, 17, 64, device="cuda", dtype=torch.float16)
+        for args in ((q.float(), q, q), (q, q[:, :, :16], q), (q.cpu(),) * 3,
+                     (q.transpose(-1, -2),) * 3, (q.clone().requires_grad_(), q, q),
+                     (torch.ones(1, 1, 4, 32, device="cuda", dtype=torch.float16),) * 3,
+                     (torch.ones(1, 1, 1025, 64, device="cuda", dtype=torch.float16),) * 3):
+            with self.assertRaises(RuntimeError):
+                module.attention_tensor_core(*args)
 
     def test_decode_binding_validates_inputs(self):
         module = extension()
