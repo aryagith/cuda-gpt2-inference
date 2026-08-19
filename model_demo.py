@@ -15,7 +15,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AttentionInterface
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import sdpa_mask
 
-from attention import cuda_attention_tiled, cuda_attention_query_tiled, cuda_attention_decode
+from attention import (MAX_TILED_SEQUENCE, cuda_attention_tiled,
+                       cuda_attention_query_tiled, cuda_attention_decode, cuda_attention_tensor_core)
 
 
 MODEL_ID = "openai-community/gpt2"
@@ -24,42 +25,55 @@ MODEL_WEIGHTS_SHA256 = "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "gpt2"
 ATTENTION_NAME = "cuda_tiled_prompt"
 SINGLE_ATTENTION_NAME = "cuda_single_query_prompt"
+TENSOR_ATTENTION_NAME = "cuda_tensor_core_prompt"
+TENSOR_CALLS = {"prefill": 0, "native": 0}
 CALLS = {"single_query_tiled": 0, "query_tiled": 0, "decode_custom": 0, "sdpa_fallback": 0}
 
 
-def prompt_attention(module, query, key, value, attention_mask, force_single=False, **kwargs):
+def prompt_attention(module, query, key, value, attention_mask, force_single=False,
+                     tensor_core=False, **kwargs):
     causal = query.shape[-2] == 1 or kwargs.get("is_causal") is True
     eligible = (attention_mask is None and causal and query.is_cuda
                  and query.device == key.device == value.device
-                 and query.dtype == key.dtype == value.dtype == torch.float32
+                 and query.dtype == key.dtype == value.dtype == (torch.float16 if tensor_core else torch.float32)
                  and query.shape[:2] == key.shape[:2] == value.shape[:2]
                  and query.shape[-1] == key.shape[-1] == value.shape[-1]
-                 and query.shape[-1] <= 128
+                 and (query.shape[-1] == 64 if tensor_core else query.shape[-1] <= 128)
                  and not module.training and not (query.requires_grad or key.requires_grad or value.requires_grad)
                  and kwargs.get("dropout", 0.0) == 0.0 and kwargs.get("head_mask") is None
                  and module.scale_attn_weights and not module.scale_attn_by_inverse_layer_idx
                  and not module.reorder_and_upcast_attn and not module.is_cross_attention)
     prefill = (eligible and query.shape == key.shape == value.shape
-               and query.shape[-2] <= 256 and query.numel() <= 16 * 1024 * 1024
-               and query.numel() // query.shape[-1] * query.shape[-2] <= 16 * 1024 * 1024)
+               and query.shape[-2] <= MAX_TILED_SEQUENCE and query.numel() <= 16 * 1024 * 1024)
     decode = (eligible and query.shape[-2] == 1 and key.shape == value.shape
               and 1 < key.shape[-2] <= 1024 and key.numel() <= 16 * 1024 * 1024)
     if prefill:
+        if tensor_core:
+            TENSOR_CALLS["prefill"] += 1
+            output = cuda_attention_tensor_core(query.contiguous(), key.contiguous(), value.contiguous())
+            return output.transpose(1, 2).contiguous(), None
         use_query_tile = not force_single and query.shape[-2] >= 64
         CALLS["query_tiled" if use_query_tile else "single_query_tiled"] += 1
         kernel = cuda_attention_query_tiled if use_query_tile else cuda_attention_tiled
         output = kernel(query.contiguous(), key.contiguous(), value.contiguous())
         return output.transpose(1, 2).contiguous(), None
-    if decode:
+    if decode and not tensor_core:
         CALLS["decode_custom"] += 1
         output = cuda_attention_decode(query.contiguous(), key.contiguous(), value.contiguous())
         return output.transpose(1, 2).contiguous(), None
-    CALLS["sdpa_fallback"] += 1
+    if tensor_core:
+        TENSOR_CALLS["native"] += 1
+    else:
+        CALLS["sdpa_fallback"] += 1
     return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
 
 
 def single_prompt_attention(module, query, key, value, attention_mask, **kwargs):
     return prompt_attention(module, query, key, value, attention_mask, force_single=True, **kwargs)
+
+
+def tensor_prompt_attention(module, query, key, value, attention_mask, **kwargs):
+    return prompt_attention(module, query, key, value, attention_mask, tensor_core=True, **kwargs)
 
 
 def load_model(dtype=torch.float32):
@@ -74,6 +88,8 @@ def load_model(dtype=torch.float32):
     AttentionMaskInterface.register(ATTENTION_NAME, sdpa_mask)
     AttentionInterface.register(SINGLE_ATTENTION_NAME, single_prompt_attention)
     AttentionMaskInterface.register(SINGLE_ATTENTION_NAME, sdpa_mask)
+    AttentionInterface.register(TENSOR_ATTENTION_NAME, tensor_prompt_attention)
+    AttentionMaskInterface.register(TENSOR_ATTENTION_NAME, sdpa_mask)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_DIR, local_files_only=True, use_safetensors=True, dtype=dtype,
@@ -87,14 +103,16 @@ def load_model(dtype=torch.float32):
     return tokenizer, model
 
 
-def input_ids(tokenizer, prompt, length):
+def input_ids(tokenizer, prompt, length, *, max_length=256):
+    if not 1 <= max_length <= 1024 or (length is not None and not 1 <= length <= max_length):
+        raise ValueError("prompt length must fit the selected limit (at most 1024)")
     tokens = tokenizer(prompt, return_tensors="pt").input_ids[0]
     if tokens.numel() == 0:
         raise ValueError("prompt must tokenize to at least one token")
     if length:
         tokens = tokens.repeat((length + tokens.numel() - 1) // tokens.numel())[:length]
-    if not 1 <= tokens.numel() <= 256:
-        raise ValueError("prompt must contain 1 to 256 tokens for custom attention")
+    if not 1 <= tokens.numel() <= max_length:
+        raise ValueError(f"prompt must contain 1 to {max_length} tokens")
     return tokens.unsqueeze(0).to("cuda")
 
 
@@ -156,13 +174,14 @@ def generate(model, tokenizer, ids, new_tokens, implementation):
 
 
 @torch.inference_mode()
-def greedy_generate(model, ids, new_tokens, *, static_cache=False, token_events=None):
+def greedy_generate(model, ids, new_tokens, *, static_cache=False, token_events=None,
+                    implementation="sdpa"):
     """Fixed-count greedy generation; optionally preallocate a fresh request cache."""
     if new_tokens < 1 or ids.shape[1] + new_tokens > model.config.n_positions:
         raise ValueError("new_tokens must be positive and fit GPT-2's position limit")
     if token_events is not None and len(token_events) != new_tokens:
         raise ValueError("provide one CUDA timing event per generated token")
-    model.set_attn_implementation("sdpa")
+    model.set_attn_implementation(implementation)
     cache_args = {}
     if static_cache:
         positions = torch.arange(ids.shape[1] + new_tokens, device=ids.device)
@@ -288,32 +307,38 @@ def main():
                         help="generate once with direct greedy decoding, CUDA GELU, dynamic cache, and PyTorch SDPA")
     parser.add_argument("--dtype", choices=("float32", "float16"), default="float32",
                         help="float16 is supported by the --fast generation route")
+    parser.add_argument("--tensor-core", action="store_true",
+                        help="opt-in FP16 Tensor Core prefill; native SDPA cached decoding")
     parser.add_argument("--generation-length", type=int,
-                        help="repeat/truncate prompt tokens to this length for generation (1..256)")
+                        help="repeat/truncate prompt tokens to this length (prompt plus output <=1024)")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     lengths = [int(value) for value in args.lengths.split(",")]
-    if (any(not 1 <= length <= 256 for length in lengths)
-            or (args.generation_length is not None and not 1 <= args.generation_length <= 256)
+    if (any(not 1 <= length <= 1023 for length in lengths)
+            or (args.generation_length is not None and not 1 <= args.generation_length <= 1024)
             or args.new_tokens < 1 or args.warmup < 1 or args.repeats < 1):
-        parser.error("lengths/generation-length must be 1..256, and new-tokens/warmup/repeats positive")
+        parser.error("verification lengths must be 1..1023 (room for cached check), generation-length 1..1024, and counts positive")
     if not torch.cuda.is_available():
         parser.error("a CUDA-enabled PyTorch build is required")
     if args.dtype == "float16" and not args.fast:
         parser.error("--dtype float16 requires --fast; custom attention verification remains float32")
+    if args.tensor_core and not (args.fast and args.dtype == "float16"):
+        parser.error("--tensor-core requires --fast --dtype float16")
     torch.backends.cuda.matmul.allow_tf32 = False
     tokenizer, model = load_model(getattr(torch, args.dtype))
     loaded_model_allocated = torch.cuda.memory_allocated()
-    prompt_ids = input_ids(tokenizer, args.prompt, args.generation_length)
+    prompt_ids = input_ids(tokenizer, args.prompt, args.generation_length, max_length=1024)
     if prompt_ids.shape[1] + args.new_tokens > model.config.n_positions:
         parser.error("prompt plus generated tokens exceeds GPT-2's 1024 positions")
     if args.fast:
         from gelu_new import set_gpt2_cuda_gelu
         set_gpt2_cuda_gelu(model, True)
-        generated = greedy_generate(model, prompt_ids, args.new_tokens)
-        print(json.dumps({"route": "direct greedy, CUDA GELU, dynamic cache, efficient SDPA",
+        generated = greedy_generate(model, prompt_ids, args.new_tokens,
+                                    implementation=TENSOR_ATTENTION_NAME if args.tensor_core else "sdpa")
+        print(json.dumps({"route": "direct greedy, CUDA GELU, dynamic cache, " +
+                          ("Tensor Core prefill/native decode" if args.tensor_core else "efficient SDPA"),
                           "dtype": args.dtype,
                           "prompt_tokens": prompt_ids.shape[1], "new_tokens": args.new_tokens,
                           "text": tokenizer.decode(generated[0], skip_special_tokens=True)}, indent=2))
@@ -332,7 +357,7 @@ def main():
 
     shapes = []
     for length in lengths:
-        ids = input_ids(tokenizer, args.prompt, length)
+        ids = input_ids(tokenizer, args.prompt, length, max_length=1024)
         correctness = check_outputs(model, ids)
         baseline = benchmark(model, ids, args.warmup, args.repeats, "sdpa")
         single = benchmark(model, ids, args.warmup, args.repeats, SINGLE_ATTENTION_NAME)
@@ -352,10 +377,10 @@ def main():
         "model_id": MODEL_ID, "model_revision": MODEL_REVISION,
         "weights_sha256": MODEL_WEIGHTS_SHA256,
         "parameters": model.num_parameters(), "dtype": "float32", "heads": 12, "head_dim": 64,
-        "layers": 12, "position_limit": 1024, "custom_prompt_limit": 256,
+        "layers": 12, "position_limit": 1024, "custom_prompt_limit": MAX_TILED_SEQUENCE,
         "loaded_model_allocated_bytes": loaded_model_allocated,
         "baseline_attention": "Transformers SDPA, PyTorch EFFICIENT_ATTENTION forced",
-        "custom_prefill_dispatch": "single-query tiled below 64 tokens; four-query tiled at 64..256",
+        "custom_prefill_dispatch": "single-query tiled below 64 tokens; eight-query tiled at 64..1024",
         "decode_attention": "custom float32 cache-attention for unmasked single-token decode; SDPA fallback otherwise",
         "timing": "synchronized wall and CUDA-event time, resident token IDs; cached-token samples exclude cache prefill; CUDA events can include host launch gaps",
         "generation_timing": "paired synchronized wall time, alternating path order; includes prefill and all generated tokens",
