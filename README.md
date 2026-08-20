@@ -2,7 +2,7 @@
 
 A focused C++/CUDA learning and performance project with verified float32
 RMSNorm, causal prompt attention, cached-token attention, fused GPT-2 GELU,
-an experimental fused residual plus LayerNorm, and optional FP16 model/GELU support
+an experimental fused residual plus LayerNorm, and optional FP16 model/GELU and Tensor Core prefill support
 on an RTX 4060 Laptop GPU (8 GB). The custom attention paths run inside pinned
 GPT-2; the
 unchanged model is the correctness and latency baseline. The local,
@@ -22,7 +22,7 @@ The default remains float32. Add `--dtype float16` to use the verified FP16
 model and GELU path described in the precision experiment below; it halves
 parameter storage, while the latency advantage over optimized FP32 is workload-dependent.
 
-This generates a fixed token count for one unpadded prompt (up to 256 prompt
+This generates a fixed token count for one unpadded prompt (up to 1023 prompt
 tokens, prompt plus output at most 1024). It does not stop early at EOS or
 provide sampling. GPT-2 continues text; it is not an instruction-tuned chatbot.
 Custom attention and fused LayerNorm remain available as measured experiments.
@@ -37,13 +37,339 @@ guarantee. Native attention remains faster than our prompt kernel in the
 measured large-prompt workload. LayerNorm fusion did not establish a stable
 whole-request gain, and fresh static caching was slower in the final experiment.
 
-Final verification: CPU suites passed nine reference tests and explicitly
+Original bounded-project verification: CPU suites passed nine reference tests and explicitly
 skipped fourteen CUDA cases. Separate CUDA-enabled suites passed all 23 tests,
 including those fourteen CUDA cases; the one- and sixteen-token fast demos
 ran successfully. The final cache checks also exercised one-, eight-, and
 32-token outputs on varied prompt contents and lengths. CUDA sources were
 unchanged from their previously documented sanitizer runs. CPU CI now includes
 all four operator suites; the updated workflow has not been run on GitHub.
+
+## How the attention kernel improved, iteration by iteration
+
+The implementation progressed through the following measured experiments:
+
+| Iteration | Change | What it established |
+| --- | --- | --- |
+| Naive baseline | Separate QK, softmax, and weighted-V kernels; full score matrix | A bounded correctness baseline, limited to 256 tokens |
+| Online-softmax tiling | Stream 32-key tiles while maintaining running normalization | Removed quadratic score storage; at `[4,8,256,64]`, peak increment fell from 10 to 2 MiB |
+| Four-query tiles | Share each K/V tile across four queries | In a later same-run comparison at `[4,8,256,64]`, single/four-query time fell from 1403.6 to 856.6 µs; native still faster |
+| Longer-context support | Validate runtime lengths through 1024 and dispatch custom prefill in all layers | Enabled actual custom/native long-prompt comparisons; extending the limit alone gave no speedup |
+| Parallel softmax | All warp lanes compute weights; shuffle reductions and register state; fewer block barriers | Reduced the serial softmax work, measured separately below |
+| GPT-2 specialization | Compile a 64-wide path with smaller scratch arrays and a fixed dot-product width | Added a further measured gain while retaining generic head-width support |
+| Eight-query reuse | Share each K/V tile across eight query warps | Latest paired run reduced 992-token kernel time by 27.9%, prefill by 16.2%, and complete request time by 3.2% versus the specialized four-query version |
+| Optional Tensor Core prefill | FP16 QK and PV matrix tiles with FP32 accumulation and online softmax | At 992 tokens, 0.800 ms versus 1.942 ms for the retained FP32 kernel; native FP16 remains faster at 0.101 ms |
+
+The first experiments used different workloads and runs. Their numbers are not
+a single cumulative speedup chain. The parallel-softmax experiment's three stages were measured
+together on identical `[1,12,992,64]` float32 inputs:
+
+| Stage | Attention time | Reduction from previous custom stage | Gap versus native |
+| --- | ---: | ---: | ---: |
+| Four-query baseline, serial softmax | 4.375 ms | — | 8.67x slower |
+| Parallel softmax | 3.649 ms | 16.6% | 7.23x slower |
+| Parallel softmax + 64-wide specialization | 2.748 ms | 24.7% | 5.45x slower |
+| Native efficient SDPA | 0.505 ms | — | Baseline |
+
+Together, those changes reduced custom-kernel time by 37.2%. A subsequent
+same-run four/eight comparison measured 2.736/1.973 ms versus native 0.505 ms
+at the same shape: eight-query reuse adds 27.9% less kernel time, leaving a
+3.91x gap to native. These are separate runs; do not multiply rounded ratios
+into a claimed same-run cumulative speedup.
+
+### FP32 custom route versus default native prefill
+
+At **992 prompt tokens and 32 outputs**, the paired model comparison measured:
+
+| Measurement | Default native attention | Previous four-query version | Current eight-query version |
+| --- | ---: | ---: | ---: |
+| Full-model prefill | **27.37 ms** | 54.80 ms | 45.92 ms |
+| Complete generation request | **188.00 ms** | 202.24 ms | 195.71 ms |
+| End-to-end output tokens/s | **170.2** | 158.2 | 163.5 |
+
+Current custom prefill is **1.68x slower than native**; complete generation is
+about **4.1% slower**. It improves on the previous four-query route by 16.2% for
+prefill and 3.2% for the complete request, but it has not beaten native attention.
+The recommended route therefore continues to use native efficient SDPA.
+
+Here, "default native" means native attention in the same recommended pipeline:
+all routes use FP32 GPT-2, CUDA GELU, and fresh dynamic caches. This isolates the
+attention change rather than comparing different precision or generation loops.
+Full-model prefill includes every transformer layer and last-position logits;
+it is not the standalone attention operation in the preceding table. Inputs,
+sampling limits, paired timing, synthetic-prompt construction, and uncontrolled
+laptop conditions are described in the experiment below.
+
+## Optional Tensor Core prefill experiment
+
+The existing FP32 eight-query kernel remains available. A separate opt-in
+`cuda_attention_tensor_core` path accepts contiguous FP16 `[B,H,S,64]` tensors,
+with 1..1024 tokens, no gradients, and the existing 16M input-element limit.
+It requires a GPU with compute capability 7.0 or newer. GPT-2 uses it for
+prefill; cached single-token steps use native FP16 efficient SDPA.
+
+```text
+python model_demo.py --fast --dtype float16 --tensor-core --new-tokens 32
+python benchmark_attention.py --tensor-core --batch 1 --heads 12 --sequences 67,128,256,512,992,1024 --output results/attention-tensor-core.json
+python benchmark_context.py --tensor-core --output results/context-tensor-core.json
+```
+
+One warp handles 16 query rows, streaming 16-key tiles. CUDA WMMA computes
+QK-transpose and softmax-weights times V with FP16 operands and FP32
+accumulators. Scores, running maxima, denominators, and output numerators stay
+FP32; weights are rounded to FP16 for the second matrix multiplication, and
+the final output is FP16. Causal masks and padded tile entries are applied
+before weight multiplication. There is no full sequence-by-sequence score
+allocation. The implementation follows the alignment and warp participation
+requirements in [NVIDIA's WMMA documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html).
+Disassembly of the compiled kernel contains `HMMA.16816.F32` instructions.
+
+Same-run isolated attention measurements, `[1,12,S,64]`, in microseconds:
+
+| Tokens | Retained eight-query FP32 | Tensor Core FP16 | Native efficient FP16 |
+| --- | ---: | ---: | ---: |
+| 67 | 25.29 | 27.44 | 8.29 |
+| 128 | 67.17 | 49.36 | 8.96 |
+| 256 | 206.56 | 113.51 | 17.66 |
+| 512 | 555.08 | 256.64 | 38.66 |
+| 992 | 1942.19 | 799.92 | 100.99 |
+| 1024 | 2075.08 | 851.12 | 103.12 |
+
+At 992 tokens this is 2.43x faster than our FP32 kernel, but 7.92x slower than
+native FP16. The comparison with FP32 changes both precision and implementation;
+it does not isolate the gain from Tensor Core instructions alone. The FP32 path
+receives exact float casts of the same FP16 inputs. Nine samples rotate/reverse
+route order; each uses five CUDA graph replays with eight operations. Capture,
+compilation, and warmup are excluded. Flash SDPA is unavailable in this Windows
+PyTorch build; the available native efficient backend is measured explicitly.
+
+The full-model FP16 experiment used CUDA GELU and fresh dynamic caches on both
+sides, 32 generated tokens, three repeated/truncated prompt token sequences,
+and three passes per prompt. All 36 native/custom request pairs matched exact
+generated IDs and text. Prompt and cached logits had maximum absolute differences
+of 0.25; checks used preselected `rtol=0.02, atol=0.15` (combined relative and
+absolute tolerance), separately from the tighter FP32 checks. These are numerical
+and deterministic-generation checks, not a broad language-quality evaluation.
+
+At 992 tokens, sequential-group prefill medians were 12.74 ms native versus
+19.67 ms custom; paired complete requests were 263.51 versus 287.52 ms,
+or 121.4 versus 111.3 output tokens/s. Requests include tokenization, input
+construction/transfer, prefill, decode, and detokenization; no graphs.
+Laptop timings varied substantially, so this run establishes no whole-request
+speedup. Native remains the recommended route. This initial WMMA kernel uses
+synchronous small tiles and shared-memory staging; further performance work
+needs measured changes to tile size, warp utilization, and staging.
+
+CPU verification: five reference/validation tests passed, eight CUDA tests
+explicitly skipped. Separate CUDA verification: all 13 attention tests passed,
+including FP64 oracles, high finite logits, partial tiles, exact causal guards,
+nondefault streams, and native-binding rejection checks. Focused Tensor Core
+memcheck and synccheck reported zero errors; racecheck reported zero hazards,
+errors, or warnings. Results are recorded under ignored `results/`.
+Source-hashed paired kernel/model reports and compiled disassembly also stay
+local. The private study guide explains the new arithmetic and precision tradeoff.
+
+## Eight-query reuse experiment
+
+The latest kernel uses eight query warps (256 threads) per block. Each warp
+retains its own online-softmax state, while all eight reuse the loaded K/V tile.
+Declared shared storage for 64-wide heads rises from 17,920 to 19,456 bytes
+per block, but it serves twice as many queries. The generic 128-wide allocation
+is 37,888 bytes. Other operations and the short-prompt single-query route are
+unchanged. The input, precision, and causal-mask contracts are unchanged.
+
+Same-run four/eight/native attention medians, microseconds, float32:
+
+| Shape `[B,H,S,D]` | Four-query | Eight-query | Efficient SDPA |
+| --- | ---: | ---: | ---: |
+| `[1,12,17,64]` | 5.94 | 5.89 | 11.24 |
+| `[1,12,64,64]` | 28.80 | 23.60 | 13.57 |
+| `[1,12,128,64]` | 85.58 | 67.53 | 25.91 |
+| `[1,12,256,64]` | 265.65 | 212.97 | 74.57 |
+| `[1,12,512,64]` | 766.41 | 555.98 | 156.54 |
+| `[1,12,992,64]` | 2736.23 | 1973.09 | 504.76 |
+| `[1,1,1024,128]` | 667.26 | 499.00 | 183.76 |
+
+The 17-token difference is small and not treated as a useful win; model dispatch
+still uses the single-query path below 64. The measured longer shapes improved
+with eight-query reuse, so it is retained. All candidates passed the explicit
+oracle before timing. Nine rotated/reversed-order samples each timed five graph
+replays of eight operations; capture/loading/compilation/warmup were excluded.
+
+Paired full-model four/eight/native medians used the same CUDA GELU, dynamic
+cache, and 32 output tokens on three repeated/truncated prompt sequences:
+
+| Prompt S | Four / eight / native prefill ms | Four / eight / native request ms | Four / eight / native output tokens/s | Eight wins vs four |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 21.40 / 18.97 / 13.90 | 171.55 / 171.58 / 168.02 | 186.5 / 186.5 / 190.5 | 4/9 |
+| 992 | 54.80 / 45.92 / 27.37 | 202.24 / 195.71 / 188.00 | 158.2 / 163.5 / 170.2 | 9/9 |
+
+All four/eight/native generations matched exact IDs and text. Custom dispatch
+assertions confirmed 12 custom prefill calls, 372 decode calls, and zero native
+fallbacks per request. The long case shows a local request gain over four-query;
+the 512-token request medians are effectively equal, so no request win is claimed
+there. Routes rotated/reversed over nine samples per length; full requests used
+synchronized wall time without graphs and included tokenizer, prompt construction,
+transfer, prefill, decode, and text decoding. Module switching/loading/compilation/
+warmup were excluded. Laptop conditions remained uncontrolled.
+
+Nsight hardware-counter profiling was attempted but failed with
+`ERR_NVGPUCTRPERM`; occupancy, bank conflicts, and stall reasons were not measured.
+A separate five-invocation CUDA trace confirmed the 64-wide query kernel ran.
+Binary resource inspection found 40 registers per thread, 19,456/37,888 bytes
+shared storage for the 64/128-wide variants, and zero static local/stack bytes.
+These are compiled resource figures, not measured occupancy. Instrumented trace
+durations are diagnostic and are not compared with unprofiled benchmark medians.
+
+CPU: four attention references passed, seven CUDA cases explicitly skipped.
+GPU: all eleven attention tests passed, including a new `[1,2,67,64]` case that
+leaves only three valid query warps in the final eight-query block, plus partial
+key tiles, float64 oracles, masks, streams, and native validation. Full-model
+hidden-state, prompt-logit, and cached-logit checks passed at 67/513/1023 tokens.
+Focused memcheck/synccheck each completed with zero errors and racecheck with
+zero hazards/errors/warnings for the eight-query 64- and 128-wide paths.
+Ignored evidence: `results/attention-eight-{ablation,model-paired}.json`,
+`results/model-eight-final.json`, `results/attention-eight/` source snapshot and
+helpers, and `results/attention-eight-{cuda,profile,trace,resources,memcheck,synccheck,racecheck}.log`.
+
+## Parallel softmax and GPT-2 head specialization (four-query stage)
+
+At this stage, the four-query kernel computed each tile's softmax across all 32 lanes of
+its query warp. Warp shuffles reduce the maximum and denominator; running
+normalization state stays in registers. Query-local weight sharing uses
+`__syncwarp()`, while the shared K/V tiles still require block barriers. This
+reduces block-wide barriers per key tile from four to two. A compile-time
+64-wide specialization reserves only the space GPT-2 needs; other supported
+head widths retain the generic 128-wide storage path. Declared shared arrays
+fell from 35,888 to 17,920 bytes per specialized block. This is a storage count,
+not a measured occupancy claim.
+
+Same-run ablation on the RTX 4060 Laptop, float32, TF32 disabled, `[1,12,S,64]`:
+
+| Prompt S | Original µs | Parallel softmax only µs | Plus 64-wide specialization µs | Efficient SDPA µs |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 131.53 | 113.38 | 85.94 | 26.32 |
+| 256 | 333.18 | 282.52 | 212.68 | 57.55 |
+| 512 | 1214.00 | 1018.57 | 766.62 | 157.44 |
+| 992 | 4374.73 | 3649.43 | 2748.19 | 504.73 |
+
+At 992 tokens, parallel softmax reduced time by 16.6%; specialization reduced
+it a further 24.7%, for **37.2% less time (1.59x faster)** than the original
+custom kernel. The remaining gap versus native is about 5.45x. The generic
+`[1,1,1024,128]` path improved from 769.15 to 670.52 µs; its two parallel-stage
+implementations measured nearly identically, as expected without 64-wide
+dispatch. All routes passed the explicit oracle; maximum custom error was
+1.02e-6 across these shapes.
+
+A separate paired old/new/native model run kept CUDA GELU, fresh dynamic caches,
+and fixed-count 32-token decoding identical on all routes:
+
+| Prompt S | Original / new / native prefill ms | Original / new / native request ms | Original / new / native output tokens/s | New wins vs original |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 26.92 / 21.63 / 14.07 | 198.63 / 209.65 / 215.79 | 161.1 / 152.6 / 148.3 | 2/9 |
+| 992 | 74.68 / 55.70 / 27.37 | 219.87 / 202.23 / 188.36 | 145.5 / 158.2 / 169.9 | 9/9 |
+
+The 992-token case establishes a local improvement over the old custom path:
+prefill time fell 25.4% and complete request time 8.0%. Native attention remains
+faster there. The 512-token prefill improvement did not establish a stable
+whole-request gain: request samples varied substantially, especially early in
+that run. No broader latency claim is made from its median ordering.
+All old/new/native pairs matched exact IDs and decoded text; custom routes
+asserted 12 custom prefill calls, 372 custom decode calls, and zero fallbacks.
+The normal context benchmark also passed all 36 native/new pairs at
+128/256/512/992 tokens. Native remains the recommended attention route.
+
+The isolated ablation used nine rotated/reversed-order samples per shape,
+each timing five graph replays of eight operations. Capture, compilation, and
+warmup are excluded. The paired model run used nine requests per route/length,
+three synthetic repeated/truncated prompt sequences, and synchronized wall
+time without graphs. Full requests include tokenization, construction/transfer,
+prefill, decode, and text decoding; model/module switching, loading, compilation,
+and warmup are outside timing. Laptop conditions were uncontrolled. Raw samples,
+stage source snapshots, and hashes are ignored under `results/attention-ablation/`,
+`results/attention-warp-{ablation,model-paired}.json`, and
+`results/context-warp-final.json`. Run the ordinary context/attention benchmarks
+below to reproduce the current route; the old stages are local evidence.
+
+CPU verification: four attention reference tests passed; seven CUDA tests were
+explicitly skipped. Separate GPU verification: all eleven attention tests
+passed, including partial tiles, 992-token GPT-2 head widths, 1024-token
+128-wide fallback, float64 comparison, causal masking, and non-default streams.
+Focused memcheck/synccheck each reported zero errors and racecheck zero
+hazards/errors/warnings for the changed query kernel's 64- and 128-wide paths.
+Full GPT-2 hidden-state, prompt-logit, and cached-logit verification also passed
+at 513/1023 tokens after the reduction change. Final reports' source hashes,
+sample counts, custom dispatch, exact outputs, and sanitizer summaries were checked.
+
+## Longer-context attention measurements before warp optimization
+
+The context sweep covers 128, 256, 512, and 992 prompt tokens with 32 output
+tokens, fitting GPT-2's 1024-position limit. Both routes use CUDA GELU and a
+fresh dynamic cache. Both tiled prefill kernels now support runtime sequence
+lengths through 1024, including partial tiles. The adapter uses custom prefill
+and cached-token attention throughout this sweep; dispatch assertions reject
+silent fallback. The naive three-kernel baseline retains its actual 256-token
+softmax limit. Extending support does not itself improve performance.
+
+```text
+python benchmark_context.py --output results/context.json
+python benchmark_attention.py --batch 1 --heads 12 --sequences 128,256,512,992 --output results/attention-context.json
+python benchmark_decode.py --lengths 128,256,512,1024 --output results/decode-context.json
+```
+
+Local RTX 4060 Laptop results on 2026-09-30, float32 with TF32 disabled:
+
+| Prompt tokens | Native / custom full-model prefill ms | Native / custom request ms | Native / custom output tokens/s | Native / four-query attention µs |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 6.72 / 7.44 | 167.22 / 167.24 | 191.4 / 191.3 | 19.48 / 132.53 |
+| 256 | 9.17 / 12.74 | 167.19 / 166.83 | 191.4 / 191.8 | 56.04 / 333.06 |
+| 512 | 17.00 / 29.32 | 169.04 / 180.26 | 189.3 / 177.5 | 156.49 / 1219.89 |
+| 992 | 31.86 / 75.34 | 180.37 / 218.12 | 177.4 / 146.7 | 504.32 / 4372.94 |
+
+All 36 generation pairs matched exact IDs and decoded text. Same-input prompt
+and cached-token logits passed rtol 1e-3, atol 5e-3; maximum observed difference
+was 0.000122. Dispatch assertions verified all 12 layers used custom prefill
+and all cached forwards used custom decode, with zero native fallbacks. The
+isolated kernels were checked against the explicit matmul/mask/softmax oracle
+at every length; maximum four-query absolute error was 1.02e-6. At 992 tokens,
+single-query tiled attention took 7747.12 µs; four-query sharing reduced that
+to 4372.94 µs, but efficient SDPA remained much faster. Both custom and native
+paths allocated 2.91 MiB above resident inputs for this standalone shape.
+
+Isolated cached-token attention did win: custom/native medians were
+19.17/24.47, 37.30/45.95, 74.62/89.42, and 128.51/152.65 µs for caches
+of 128, 256, 512, and 1024 tokens. Those savings did not establish a reliable
+whole-request win in the sweep above.
+
+These are **controlled context-length experiments**: three prompt token
+sequences are repeated/truncated to exact lengths, not natural long documents
+or a model-quality test. Request medians use nine alternating-order pairs per
+length and include tokenization, input transfer, prompt construction, prefill,
+fixed-count decoding, and text decoding. Loading, compilation, and warmup are
+excluded; no graph capture is used for requests. Prefill-only measurements use
+resident IDs and sequential route groups, so small route differences are not
+reliable paired wins. Standalone attention uses CUDA graph replay events to
+isolate warmed operations; its timings exclude capture and are not request
+latencies. Laptop clocks and thermals were uncontrolled, and request samples
+vary substantially; the nonmonotonic request medians are not evidence that
+longer prompts cost less. No consistent overall custom-attention win emerged.
+
+CPU verification: four attention reference tests passed; seven CUDA tests were
+explicitly skipped. Separate CUDA verification: all eleven attention tests passed,
+plus the context sweep's model-logit, dispatch, generation, and isolated
+attention oracle checks. Added long-prefill coverage at 257/513/1024 tokens,
+odd head width, multiple batches/heads, non-default streams, causal perturbation,
+float64 comparison, and rejection above the supported bounds. Native validation
+was extended for tiled paths; the tile-processing CUDA arithmetic is unchanged.
+Focused Compute Sanitizer memcheck/synccheck each reported zero errors and
+racecheck zero hazards/errors/warnings for both tiled kernels at 513 and 1024
+tokens. The model CLI also passed complete hidden-state, prompt-logit, and
+cached-logit checks at 513/1023 tokens, with a 992-token generation prompt.
+Raw samples,
+source hashes, model pin, and runtime metadata are saved under ignored
+`results/{context-long-custom,attention-long-custom,decode-context-final}.json`.
+The earlier `context-final.json` experiment used native fallback above 256 and
+does not measure custom long prefill; it is retained only as historical evidence.
 
 ## First operation
 
@@ -67,9 +393,11 @@ For each row, compute `y = x * rsqrt(mean(x*x) + eps) * weight`.
 | `benchmark.py` | Warmed repeated measurements and JSON metadata |
 | `attention.py` | Causal-attention oracle, contract, extension loader |
 | `csrc/attention_bindings.cpp` | Independent native attention validation |
-| `csrc/attention.cu` | Three-kernel baseline, single-query and four-query prompt tiles, cache decode |
+| `csrc/attention.cu` | Three-kernel baseline, single-query and eight-query prompt tiles, cache decode |
+| `csrc/attention_tensor_core.cu` | Optional FP16 WMMA prompt attention with FP32 accumulation, head width 64 |
 | `test_attention.py` | CPU oracle, CUDA, masking, and stream checks |
 | `benchmark_attention.py` | Attention correctness, graph latency, and peak allocation |
+| `benchmark_context.py` | FP32 or optional FP16 Tensor Core/native context sweep and paired request timing |
 | `benchmark_decode.py` | One-query cache-attention correctness and graph latency |
 | `model_demo.py` | Pinned GPT-2, prompt/decode adapter, checks, generation, model benchmark |
 | `benchmark_greedy.py` | Varied-prompt end-to-end greedy generation comparison |
@@ -92,10 +420,10 @@ in the local JSON reports. Laptop clocks and thermals were not controlled.
 
 **What runs where.** A three-kernel causal baseline exposes the score matrix.
 Prompt kernels use online softmax over 32-key tiles and allocate only output;
-the four-query version shares a K/V tile across four warps. A separate kernel
+the current eight-query version shares a K/V tile across eight warps. A separate kernel
 handles one new query against cached K/V, which includes the current token.
 `model_demo.py` sends supported GPT-2 prefill below 64 tokens to the
-single-query tile, 64–256 tokens to the four-query tile, and unmasked one-token
+single-query tile, 64–1024 tokens to the eight-query tile, and unmasked one-token
 decode through cache length 1024 to the decode kernel. Other calls use
 Transformers SDPA. The custom operators are float32, contiguous, forward-only,
 and do not cover padding masks, grouped-query attention, dropout, or training.
