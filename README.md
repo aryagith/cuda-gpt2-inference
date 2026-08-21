@@ -1,4 +1,4 @@
-# CUDA Attention Engine
+# cuda-gpt2-inference
 
 A focused C++/CUDA learning and performance project with verified float32
 RMSNorm, causal prompt attention, cached-token attention, fused GPT-2 GELU,
